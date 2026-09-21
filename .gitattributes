@@ -1,0 +1,33 @@
+# Line endings.
+#
+# `text=auto` stores every text file as LF in the repository. `eol=lf` also
+# checks it out as LF, which is the part that matters on Windows: with
+# core.autocrlf left on, git otherwise rewrites the working tree to CRLF and
+# warns on every `git add`. Pinning both ends keeps Windows checkouts identical
+# to what Linux CI tests, so a contributor never sees a whole-file diff that is
+# only line endings.
+* text=auto eol=lf
+
+# Shell scripts must stay LF even where a tool would prefer otherwise --
+# CRLF makes a shebang unrunnable.
+*.sh text eol=lf
+
+# Binary assets: never converted, never diffed as text. `text=auto` detects most
+# of these on content, but being explicit keeps a stray heuristic from mangling
+# a checkpoint or a logo.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.safetensors   binary
+*.onnx          binary
+*.pt            binary
+*.bin           binary
+
+# Generated or vendored trees: keep them out of diff and language stats so a
+# review shows the actual change.
+graft/**                    linguist-generated=true
+.claude/skills/**           linguist-vendored=true
+research/results/*.json     linguist-generated=true
