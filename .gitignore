@@ -54,4 +54,4 @@ graft/
 # parent directory is excluded, so .claude/skills/ is re-admitted explicitly.
 .claude/*
 !.claude/skills/
-/.ignore
+
