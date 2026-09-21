@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Laya Router Decision Flow</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #eceef1;   /* logo off-white */
+      --color-ink:     #111111;   /* logo near-black */
+      --color-muted:   #4f5d75;   /* blue-slate */
+      --color-accent:  #2a78d6;   /* laya logo blue */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1320px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .sub {
+      font-size: 0.85rem;
+      line-height: 1.5;
+      color: var(--color-muted);
+      max-width: 68ch;
+      margin-bottom: 1.5rem;
+    }
+
+    .sub code { font-family: var(--font-mono); font-size: 0.8rem; }
+
+    svg { width: 100%; min-width: 1100px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Router decision flow · laya 0.3.5</p>
+    <h1>Which checkpoint answers this request?</h1>
+    <p class="sub">Precedence runs top to bottom: anything the caller pins wins, then an opt-in workflow match,
+      then detection. <code>Router.route()</code> loads nothing and runs no forward pass — it is pure, so the
+      decision is inspectable before a single token is spent.</p>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="laya-router-flow-title laya-router-flow-desc">
+      <title id="laya-router-flow-title">Laya router decision flow</title>
+      <desc id="laya-router-flow-desc">Decision flowchart for Router.route(). A state and questions enter; an explicit model, task or lang argument short-circuits to the caller's checkpoint; an opt-in workflow match selects the typed-decisions checkpoint; otherwise script detection decides — a non-Latin script goes to the multilingual checkpoint, a state with no letters falls back to the English default, and Latin text is tested for English, sending non-English Latin text to multilingual and English text to the English checkpoint.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2a78d6"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#1d3f6e"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#eceef1"/>
+
+      <!-- ================= ARROWS (drawn before nodes) ================= -->
+
+      <!-- start -> D1 -->
+      <line x1="340" y1="92" x2="340" y2="124" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- D1 yes -> caller's checkpoint -->
+      <line x1="456" y1="160" x2="860" y2="160" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="622" y="140" width="60" height="12" rx="2" fill="#eceef1"/>
+      <text x="652" y="149" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EXPLICIT</text>
+
+      <!-- D1 no -> D2 -->
+      <line x1="340" y1="196" x2="340" y2="232" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="350" y="208" width="24" height="12" rx="2" fill="#eceef1"/>
+      <text x="362" y="217" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+
+      <!-- D2 yes -> typed-decisions -->
+      <line x1="456" y1="268" x2="860" y2="268" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="616" y="248" width="72" height="12" rx="2" fill="#eceef1"/>
+      <text x="652" y="257" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">AUTO-TASK</text>
+
+      <!-- D2 no -> D3 -->
+      <line x1="340" y1="304" x2="340" y2="340" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="350" y="316" width="24" height="12" rx="2" fill="#eceef1"/>
+      <text x="362" y="325" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+
+      <!-- D3 non-latin -> multilingual (THE consequential exit) -->
+      <line x1="456" y1="376" x2="860" y2="376" stroke="#2a78d6" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <rect x="616" y="356" width="72" height="12" rx="2" fill="#eceef1"/>
+      <text x="652" y="365" fill="#2a78d6" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NON-LATIN</text>
+
+      <!-- D3 no letters -> english (default fall-back, routed around the left margin) -->
+      <path d="M224,376 H148 Q140,376 140,384 V572 Q140,580 148,580 H250"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="54" y="460" width="76" height="12" rx="2" fill="#eceef1"/>
+      <text x="92" y="469" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO LETTERS</text>
+
+      <!-- D3 latin -> D4 -->
+      <line x1="340" y1="412" x2="340" y2="448" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="350" y="424" width="44" height="12" rx="2" fill="#eceef1"/>
+      <text x="372" y="433" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LATIN</text>
+
+      <!-- D4 no -> multilingual (enters from below, own attach point) -->
+      <path d="M456,484 H912 Q920,484 920,476 V400"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="638" y="464" width="84" height="12" rx="2" fill="#eceef1"/>
+      <text x="680" y="473" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NOT ENGLISH</text>
+
+      <!-- D4 yes -> english -->
+      <line x1="340" y1="520" x2="340" y2="556" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="350" y="532" width="60" height="12" rx="2" fill="#eceef1"/>
+      <text x="380" y="541" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ENGLISH</text>
+
+      <!-- ================= NODES ================= -->
+
+      <!-- START (oval) -->
+      <rect x="250" y="44" width="180" height="48" rx="20" fill="#eceef1"/>
+      <rect x="250" y="44" width="180" height="48" rx="20" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="340" y="66" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">State + questions</text>
+      <text x="340" y="80" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">route(state, questions)</text>
+
+      <!-- D1 (diamond) -->
+      <polygon points="340,124 456,160 340,196 224,160" fill="#eceef1"/>
+      <polygon points="340,124 456,160 340,196 224,160" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="340" y="156" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Caller pinned it?</text>
+      <text x="340" y="172" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">model= · task= · lang=</text>
+
+      <!-- D2 (diamond) -->
+      <polygon points="340,232 456,268 340,304 224,268" fill="#eceef1"/>
+      <polygon points="340,232 456,268 340,304 224,268" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="340" y="264" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Workflow match?</text>
+      <text x="340" y="280" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">auto_task_detection</text>
+
+      <!-- D3 (diamond, FOCAL — the one consequential decision) -->
+      <polygon points="340,340 456,376 340,412 224,376" fill="#eceef1"/>
+      <polygon points="340,340 456,376 340,412 224,376" fill="rgba(42,120,214,0.08)" stroke="#2a78d6" stroke-width="1.2"/>
+      <text x="340" y="372" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Which script?</text>
+      <text x="340" y="388" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">detect_script()</text>
+
+      <!-- D4 (diamond) -->
+      <polygon points="340,448 456,484 340,520 224,484" fill="#eceef1"/>
+      <polygon points="340,448 456,484 340,520 224,484" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="340" y="480" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Reads as English?</text>
+      <text x="340" y="496" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">is_english()</text>
+
+      <!-- T1 caller's checkpoint (oval) -->
+      <rect x="860" y="136" width="240" height="48" rx="20" fill="#eceef1"/>
+      <rect x="860" y="136" width="240" height="48" rx="20" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="980" y="158" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Caller's checkpoint</text>
+      <text x="980" y="172" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no detection run</text>
+
+      <!-- T2 typed-decisions (oval) -->
+      <rect x="860" y="244" width="240" height="48" rx="20" fill="#eceef1"/>
+      <rect x="860" y="244" width="240" height="48" rx="20" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="980" y="266" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">typed-decisions</text>
+      <text x="980" y="280" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ModernBERT-large · 1024</text>
+
+      <!-- T3 multilingual (oval) -->
+      <rect x="860" y="352" width="240" height="48" rx="20" fill="#eceef1"/>
+      <rect x="860" y="352" width="240" height="48" rx="20" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="980" y="374" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">multilingual</text>
+      <text x="980" y="388" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">mmBERT-base · 1024</text>
+
+      <!-- T4 english (oval) -->
+      <rect x="250" y="556" width="180" height="48" rx="20" fill="#eceef1"/>
+      <rect x="250" y="556" width="180" height="48" rx="20" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="340" y="578" fill="#111111" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">english</text>
+      <text x="340" y="592" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ModernBERT-large · 512</text>
+
+      <!-- ================= LEGEND ================= -->
+      <line x1="40" y1="652" x2="1240" y2="652" stroke="rgba(17,17,17,0.10)" stroke-width="0.8"/>
+      <text x="40" y="668" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="140" y="658" width="16" height="10" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="164" y="668" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">START / CHECKPOINT</text>
+
+      <polygon points="368,658 380,663 368,668 356,663" fill="#ffffff" stroke="#111111" stroke-width="1"/>
+      <text x="390" y="668" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">DECISION</text>
+
+      <line x1="520" y1="663" x2="548" y2="663" stroke="#2a78d6" stroke-width="1.4"/>
+      <text x="556" y="668" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">CONFIDENCE CANNOT UNDO THIS ONE</text>
+    </svg>
+  </div>
+</body>
+</html>
