@@ -45,3 +45,13 @@ credentials.json
 # terminal transcripts dumped by the CLI (they quote whatever was pasted, including tokens)
 [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*-local-command-*.txt
 *-local-command-*.txt
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
+
+# Claude Code local state: keep vendored skills, ignore everything else
+# (settings, local agents, session state). Git will not re-include a path whose
+# parent directory is excluded, so .claude/skills/ is re-admitted explicitly.
+.claude/*
+!.claude/skills/
+/.ignore
