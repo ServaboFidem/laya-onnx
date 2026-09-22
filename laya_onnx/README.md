@@ -23,11 +23,14 @@ measured here, int8 bought 4–23% and cost the labels.
 (~1.29 GB) exceed protobuf's 2 GB message limit well before you get to a single-file
 serialization that onnx can load safely. `model.onnx` alone is ~2.8 MB of graph structure with
 every initializer pointing at the sidecar. Copy only `model.onnx` to a serving host and you
-deploy a model that cannot run — and the failure arrives at `OnnxSession.__init__`, as a raw
-onnxruntime error about a missing external-data file, not as anything that mentions the
-export. **That is a known rough edge**: the exporter enforces the pairing at write time, the
-session does not re-check it at load time. Treat the export directory as the unit of
-deployment:
+deploy a model that cannot run. Both ends check for it: the exporter enforces the pairing at
+write time, and `OnnxSession.__init__` walks the graph's declared external-data locations
+(`declared_external_data`, a 40-line protobuf varint walker, because the runtime deliberately
+does not ship `onnx`) and raises `FileNotFoundError` naming the missing sidecar before
+onnxruntime gets to report it as an opaque external-data error from inside tensor loading. The
+remaining rough edge is that the walker reads the whole graph file, which is free on fp32
+(2.8 MB) and not on the single-file int8 builds (325–915 MB). Treat the export directory as the
+unit of deployment:
 
 ```
 <export_dir>/
@@ -109,27 +112,28 @@ thread count:
 | 10 | 1135.6 ms | 1201.2 ms | 1.06x (ONNX slower) |
 | 50 | 3689.5 ms | 6689.7 ms | **1.81x** (ONNX slower) |
 
-**Nothing in this tree reproduces the torch column, and nothing in CI reproduces either.**
-`bench_latency.py` measures the ONNX column only — by construction, not by omission: it refuses
-to let torch into the process at all (item 4 of `laya_onnx/bench/bench_latency.py`'s docstring,
-"Torch-free by construction", explains why a latency number for the ONNX path measured beside a
-resident torch is not the number a deployment gets), and its `main()` calls `laya_onnx.load`
-and nothing else. So the "Reproduce
-with:" block above regenerates the right-hand column; the torch p50s came from a separate
-off-tree run of the same state, the same questions and the same 5-warmup/50-run protocol on the
-same host, and no script in this repository re-derives them. Read them as a recorded
-measurement with a stated method, not as a checked-in one — the same standing as the 3.719e-05
-parity figure at the top of this file. If this comparison has to be re-run, the honest way is
-two processes, not one.
+**Nothing in CI reproduces either column.** `bench_latency.py` measures the ONNX column only —
+by construction, not by omission: it refuses to let torch into the process at all (item 4 of
+`laya_onnx/bench/bench_latency.py`'s docstring, "Torch-free by construction", explains why a
+latency number for the ONNX path measured beside a resident torch is not the number a
+deployment gets), and its `main()` calls `laya_onnx.load` and nothing else. The torch column
+comes from `laya_onnx/bench/bench_torch.py`, which imports the same `STATE`, `questions()` and
+`measure()` and runs them against `laya.load(...)` in its own process. The table above predates
+that script — its torch p50s came from an equivalent off-tree run with the same protocol — and
+the 4-thread table below is the first one both scripts produced. Re-running the comparison is
+always two processes, not one: a single process that timed both would let whichever library
+initialised first shape the other's thread pool.
 
-**The ONNX port is not a speed win on this host, and above one question per call it is a
-loss.** That is worth saying plainly, because "export to ONNX" is usually pitched as an
-optimization. The reason to take this port is the one in the package docstring: a serving
-process with onnxruntime and numpy and *neither torch nor transformers*, which is a smaller
-image, a faster cold start and a much smaller dependency surface. Latency parity at N=1 is the
-bar it has to clear, and it clears it; throughput at N=50 is a cost it currently pays. The
-likely cause is that torch's CPU GEMM path batches better than onnxruntime's on this two-socket
-machine, but nothing here measures that, so it stays a hypothesis.
+**At each library's default thread count the ONNX port is not a speed win on this host, and
+above one question per call it is a loss.** That is worth saying plainly, because "export to
+ONNX" is usually pitched as an optimization. The reason to take this port is the one in the
+package docstring: a serving process with onnxruntime and numpy and *neither torch nor
+transformers*, which is a smaller image, a faster cold start and a much smaller dependency
+surface. Latency parity at N=1 is the bar it has to clear, and it clears it. The loss at N=5
+and N=50 is a property of the 80-way default pools on this two-socket machine, not of the
+graph: pin both libraries to 4 threads and it is gone (the "Four threads" table below). *Why*
+torch's default pool batches better than onnxruntime's on two sockets is still unmeasured, and
+stays a hypothesis.
 
 ### Thread count
 
@@ -146,6 +150,39 @@ CPU-quota'd container than the 80-way default:
 Eight threads is the better setting for single-question calls on this host and the worse one
 for batched calls. There is no default that is right for both; pass `threads=` deliberately,
 especially under a process pool, where leaving it unset gives every worker a full-width pool.
+
+#### Four threads, both libraries
+
+The commodity case, as close as this host can get to it: `bench_latency --threads 4` and
+`bench_torch --threads 4`, same state, same questions, two processes, **3 warmup and 20 timed
+runs** rather than the 5/50 of the tables above — read these to two significant figures too.
+Four threads of a Xeon Gold 6148 (AVX-512, 2.4 GHz) is a proxy for a small CPU-quota'd
+container, not for a laptop; nobody has measured a laptop.
+
+| questions per call | torch p50 (4 threads) | ONNX fp32 p50 (4 threads) | ONNX vs. torch |
+|---|---|---|---|
+| 1 | 288.7 ms | 254.3 ms | **0.88x** (ONNX faster) |
+| 5 | 1187.6 ms | 1190.7 ms | 1.00x |
+| 10 | 2312.7 ms | 2434.5 ms | 1.05x (ONNX slower) |
+
+The 1.40x and 1.81x losses of the default-threads table are gone. The honest summary is
+therefore: at the thread counts this port is for, fp32 ONNX is at parity with torch or ahead of
+it, and the two-socket numbers above are what happens when each library is handed 40 physical
+cores and sizes its own pool.
+
+**Where the remaining time goes, and what does not recover it.** An onnxruntime profile of a
+5-question call at 4 threads puts `MatMul` at 56% of kernel time, with `Transpose`,
+`LayerNormalization`, `Softmax` and `Split` — the rotary and attention glue of a ModernBERT
+layer — at another ~27%. onnxruntime's own graph optimizer (`ORT_ENABLE_ALL`, the level
+`OnnxSession` sets) fuses almost none of it on this dynamo capture: one
+`SkipLayerNormalization`, 24 `FusedMatMul`, no GELU and no attention fusion. Its offline
+transformer optimizer (`onnxruntime.transformers.optimizer`, `model_type="bert"`, 12 heads,
+hidden 768) fuses the 24 GELUs and nothing else — zero `Attention`, `MultiHeadAttention` or
+`RotaryEmbedding` matches — and the fused graph answered the six benchmark questions
+identically to four decimals at 0.3–2.0% lower p50 at 4 threads, inside run-to-run spread. So
+the fp32 headroom is real but not a switch: fusing this model's attention means custom pattern
+work against this specific capture (rotary on q and k, a 128-token sliding-window mask on every
+layer but each third), and nothing in this tree has attempted it.
 
 ### int8, for completeness — still not recommended
 

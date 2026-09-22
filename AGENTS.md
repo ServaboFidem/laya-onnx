@@ -173,9 +173,12 @@ those are labelled hypotheses there and should stay labelled.
 **An export is two files.** `export_fp32` writes `model.onnx` (~2.8 MB of graph) *and*
 `model.onnx.data` (~1.29 GB of initializers); the weights exceed protobuf's message ceiling, so
 external data is not optional. Copying only `model.onnx` deploys a model that cannot run. The
-exporter verifies the pairing at write time; `OnnxSession.__init__` does **not**, so a missing
-sidecar surfaces at serving time as a raw onnxruntime external-data error that says nothing
-about the export. Known rough edge — if you improve one thing here, improve that.
+exporter verifies the pairing at write time, and `OnnxSession.__init__` verifies it at load time:
+`declared_external_data` walks the graph's initializers with a hand-rolled protobuf reader (the
+runtime does not ship `onnx`) and raises `FileNotFoundError` naming the missing sidecar, before
+onnxruntime can report it as an opaque external-data error. The walker reads the whole graph
+file — free on fp32 (2.8 MB), 325–915 MB on the single-file int8 builds. Known rough edge — if
+you improve one thing here, improve that.
 
 **Confidence from this checkpoint is not calibrated.** `laya-multilingual` ships
 `temperature_by_options: {}`. The port fitted the first temperatures it has ever had, but only
@@ -185,19 +188,19 @@ which should not be read as converged. `write_temperatures` records that coverag
 `temperature_by_options_provenance`. Do not write code or docs that treat `confidence` from this
 checkpoint as calibrated.
 
-**Latency is measured, and on the one host measured it is not a speed win.** Read that scope
-before quoting the sentence: the host is a dual Xeon Gold 6148 (40 cores / 80 threads, two
-sockets), which is close to the opposite of the commodity hardware this port targets, and is
-exactly the regime where torch's threaded MKL kernels do best and onnxruntime's default
-core-wide thread pool does worst. Nobody has measured a 4-core container, and a smaller host may
-well reverse the result.
-
-On that host (onnxruntime 1.27.0, CPUExecutionProvider), fp32 ONNX is 164.5 ms p50 at 1 question
-against torch's 175.4 ms measured the same way on the same machine, and **slower** above that:
-1.40x at 5 questions, 1.81x at 50. The reason to take this port is the dependency surface, not
-throughput. `laya_onnx/bench/bench_latency.py` produces these — nearest-rank p50/p95 over 50
-runs after 5 discarded warmup runs — and `laya_onnx/README.md` carries the full tables with the
-machine block. Any new latency claim gets the same scoping these do.
+**Latency is measured, and the answer depends on the thread count.** The host is a dual Xeon
+Gold 6148 (40 cores / 80 threads, two sockets), close to the opposite of the commodity hardware
+this port targets. At each library's *default* pool (onnxruntime 1.27.0, CPUExecutionProvider),
+fp32 ONNX is 164.5 ms p50 at 1 question against torch's 175.4 ms measured the same way on the
+same machine, and **slower** above that: 1.40x at 5 questions, 1.81x at 50. Pin both to 4
+threads — the nearest this host gets to a CPU-quota'd container — and the loss is gone: 0.88x at
+1 question, 1.00x at 5, 1.05x at 10 (3 warmup / 20 timed runs, not 5/50). So the two-socket
+loss is a thread-pool effect, not a property of the graph; a laptop is still unmeasured.
+`laya_onnx/bench/bench_latency.py` produces the ONNX column and `bench_torch.py` the torch
+column, always in two separate processes, both as nearest-rank p50/p95 after discarded warmup
+runs. `laya_onnx/README.md` carries the full tables with the machine block, plus the profile
+(MatMul 56% of kernel time at 4 threads) and the finding that onnxruntime's transformer
+optimizer fuses only GELU on this capture. Any new latency claim gets the same scoping these do.
 
 ## Testing
 
