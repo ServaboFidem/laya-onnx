@@ -2,13 +2,16 @@
 
 Why this script exists, and why it is shaped the way it is:
 
-1. **The first call is not a measurement.** `OnnxSession.__init__` builds the session with
-   `ORT_ENABLE_ALL`, but onnxruntime defers most of that work -- operator fusion, memory-arena
-   sizing, thread-pool spin-up -- until the first `run()` with a given input *shape*. Because
-   all three axes of this graph are dynamic (batch, sequence, markers), a call with 5 questions
-   pays that cost again after a call with 1 did. So `measure()` takes a `warmup` count and
-   discards those runs, and the default of 5 is not arbitrary: on the machine in the README's
-   table, run 1 at 1 question cost roughly 3x run 6, and runs 2-5 were already flat.
+1. **The first calls are discarded, though the effect is smaller than folklore says.**
+   `OnnxSession.__init__` builds the session with `ORT_ENABLE_ALL`, but onnxruntime defers part
+   of that work -- memory-arena sizing, thread-pool spin-up -- until the first `run()` at a
+   given input *shape*, and all three axes of this graph are dynamic (batch, sequence, markers),
+   so a call with 50 questions does not inherit a call with 1's setup. Measured on the host in
+   `laya_onnx/README.md`'s table, the settling is real but modest: at 1 question, runs 1-8 were
+   169, 168, 155, 153, 152, 152, 151, 150 ms (run 1 is 1.13x run 6, flat from run 3); at 50
+   questions, 6884, 6953, 6722, 6860, 6764, 6676, 6525, 6837 ms (run 1 is 1.03x run 6, inside
+   the run-to-run spread). So `warmup=5` is cheap insurance rather than a large correction --
+   do not quote it as evidence of an expensive first call on this build.
 
 2. **p50 and p95, not mean.** A mean over a CPU inference loop is dominated by whatever else the
    host was doing; the tail is the number a caller actually has to size a timeout against. 50

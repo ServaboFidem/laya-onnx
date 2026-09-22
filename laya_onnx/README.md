@@ -44,9 +44,16 @@ module docstring for why a 1024 default would be actively dangerous against a 51
 
 One `system_one` call answers N typed questions about one state in one forward pass, so the
 curve worth knowing is latency vs. questions per call. `laya_onnx/bench/bench_latency.py`
-measures it: 5 discarded warmup runs (the first call with a given input *shape* pays
-onnxruntime's fusion and arena setup, and all three axes here are dynamic), then 50 timed runs,
-reported as nearest-rank p50 and p95 so every figure is a latency that was actually observed.
+measures it: 5 discarded warmup runs, then 50 timed runs, reported as nearest-rank p50 and p95
+so every figure is a latency that was actually observed.
+
+The warmup exists because onnxruntime defers part of its setup to the first `run()` at a given
+input *shape*, and all three axes here are dynamic — but on this build the effect is smaller
+than that reasoning suggests, and it is worth saying so rather than implying a big first-call
+penalty. Measured: at 1 question, runs 1–8 were 169, 168, 155, 153, 152, 152, 151, 150 ms — run
+1 is 1.13x run 6 and the series is flat from run 3. At 50 questions: 6884, 6953, 6722, 6860,
+6764, 6676, 6525, 6837 ms — run 1 is 1.03x run 6, inside the run-to-run spread. `warmup=5` is
+cheap insurance here, not a large correction.
 
 Reproduce with:
 
