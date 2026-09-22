@@ -53,6 +53,40 @@ class ExportWrapper(torch.nn.Module):
         return self.model(input_ids, attention_mask, marker_pos, marker_mask, qtype)
 
 
+def _verify_opset(path: str, want: int) -> int:
+    """Raise unless the file at `path` really declares opset `want` for the default domain.
+
+    `opset_version=` is a request, not a guarantee. torch.export captures at its own opset (18
+    at the time of writing) and then asks a version converter to walk the graph back down. That
+    converter is best-effort, and torch says so in its own warning: "If version conversion is
+    unsuccessful, the opset version of the exported model will be kept at 18." Nothing about a
+    failed down-conversion is an error - `torch.onnx.export` still returns and still writes a
+    file, so without this check the caller, the CLI's own summary line and the port plan would
+    all go on believing the artifact is opset 17 while it is opset 18.
+
+    Down-conversion succeeds on a small BERT. The encoders this port actually ships - ModernBERT
+    and mmBERT - are exactly the op mix a version converter gives up on, and the failure would
+    land in Task 8 as a runtime incompatibility on some other host rather than here as an export
+    that refused to finish. So: read the artifact back and make the mismatch loud.
+    """
+    import onnx
+
+    model = onnx.load(path, load_external_data=False)
+    # The default ONNX domain is spelled "" (and, historically, "ai.onnx"); custom-op domains
+    # carry their own independent versions and are not what `opset_version` controls.
+    got = [o.version for o in model.opset_import if o.domain in ("", "ai.onnx")]
+    if not got:
+        raise RuntimeError("exported %s declares no default-domain opset" % path)
+    if len(got) > 1 or got[0] != want:
+        raise RuntimeError(
+            "exported %s declares opset %s, not the requested %d. torch.export captures at a "
+            "newer opset and down-converts; that conversion is best-effort and evidently did "
+            "not take here. Re-export with --opset %s, or fix the converter, rather than "
+            "shipping an artifact whose opset nobody agrees on." % (path, got, want, got[0])
+        )
+    return got[0]
+
+
 def export_fp32(model, out_path: str, opset: int = 17) -> str:
     """Trace `model` to ONNX at `out_path`, with batch, sequence and marker axes dynamic.
 
@@ -84,9 +118,18 @@ def export_fp32(model, out_path: str, opset: int = 17) -> str:
     # on the second real question. The declared input dtypes (int64 everywhere except the bool
     # marker_mask) are exactly what `laya_onnx.collate.collate` emits, so no cast is needed in
     # the hot path.
+    # `model.eval()` above does not put the wrapper itself in eval mode - `ExportWrapper` is a
+    # fresh nn.Module whose own `.training` is True, and the exporter reports the mode of the
+    # module it was handed. The captured graph is unaffected (the submodule that owns the
+    # dropout is already in eval), but the exporter emits a training-mode warning that is
+    # indistinguishable from the one you would get if dropout really were leaking into the
+    # graph. Silencing it keeps that warning meaningful.
+    wrapper = ExportWrapper(model)
+    wrapper.eval()
+
     with torch.no_grad():
         torch.onnx.export(
-            ExportWrapper(model), args, out_path,
+            wrapper, args, out_path,
             input_names=["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"],
             output_names=["logits", "act_logits"],
             dynamic_axes={
@@ -119,6 +162,8 @@ def export_fp32(model, out_path: str, opset: int = 17) -> str:
             dynamo=True,
             verbose=False,
         )
+
+    _verify_opset(out_path, opset)
     return out_path
 
 
@@ -126,22 +171,35 @@ def export_fp32(model, out_path: str, opset: int = 17) -> str:
 # temperatures and the token budget; `tokenizer/` is what `laya_onnx.tokenizer.TokenizerAdapter`
 # loads. Copying them makes the output directory self-contained, so deploying the ONNX runtime
 # never means also fetching the torch checkpoint it came from.
+#
+# Both are *required*, not best-effort. An earlier version skipped whatever was absent and
+# reported "(nothing found)" while still exiting 0, which produced exactly the artifact this
+# function exists to prevent: a graph with no tokenizer beside it, where `TokenizerAdapter`
+# finds nothing at serving time and the failure surfaces on a production host instead of on the
+# machine that did the export. A checkpoint missing either one is not a checkpoint this runtime
+# can be built from, so say so here and stop.
 _SIDECAR_FILES = ("rl_agent_config.json",)
 _SIDECAR_DIRS = ("tokenizer",)
 
 
 def _copy_sidecars(model_dir: str, out_dir: str) -> list:
+    missing = [n for n in _SIDECAR_FILES if not os.path.exists(os.path.join(model_dir, n))]
+    missing += [n + "/" for n in _SIDECAR_DIRS if not os.path.isdir(os.path.join(model_dir, n))]
+    if missing:
+        raise FileNotFoundError(
+            "checkpoint %s is missing %s, which the ONNX runtime needs beside the graph. "
+            "Export it from a complete laya checkpoint - an output directory without these is "
+            "not self-contained and will fail at load time, not here."
+            % (model_dir, ", ".join(missing))
+        )
+
     copied = []
     for name in _SIDECAR_FILES:
-        src = os.path.join(model_dir, name)
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(out_dir, name))
-            copied.append(name)
+        shutil.copy2(os.path.join(model_dir, name), os.path.join(out_dir, name))
+        copied.append(name)
     for name in _SIDECAR_DIRS:
-        src = os.path.join(model_dir, name)
-        if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(out_dir, name), dirs_exist_ok=True)
-            copied.append(name + "/")
+        shutil.copytree(os.path.join(model_dir, name), os.path.join(out_dir, name), dirs_exist_ok=True)
+        copied.append(name + "/")
     return copied
 
 
@@ -165,6 +223,14 @@ def main(argv=None) -> int:
     for p in (cfg_path, weights_path):
         if not os.path.exists(p):
             raise FileNotFoundError("not a laya checkpoint directory: missing %s" % p)
+    # The sidecars are copied after the export, but they are checked here so an incomplete
+    # checkpoint fails in a second rather than after several minutes of tracing a 421M encoder.
+    if not os.path.isdir(os.path.join(model_dir, "tokenizer")):
+        raise FileNotFoundError(
+            "not a laya checkpoint directory: missing %s. The ONNX runtime loads its tokenizer "
+            "from beside the graph, so an export without it cannot serve."
+            % os.path.join(model_dir, "tokenizer")
+        )
 
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
@@ -180,7 +246,8 @@ def main(argv=None) -> int:
 
     print("wrote %s (opset %d, reference_compile %s)"
           % (out_path, args.opset, "disabled" if had_compile_flag else "absent"))
-    print("copied alongside: %s" % (", ".join(copied) if copied else "(nothing found)"))
+    # `copied` is never empty: `_copy_sidecars` raises rather than skipping a missing sidecar.
+    print("copied alongside: %s" % ", ".join(copied))
     return 0
 
 

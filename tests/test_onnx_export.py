@@ -11,12 +11,13 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np                                          # noqa: E402
+import onnx                                                 # noqa: E402
 import onnxruntime as ort                                   # noqa: E402
 import torch                                                # noqa: E402
 from transformers import AutoConfig, AutoModel              # noqa: E402
 
 from laya.common import DecisionModel                       # noqa: E402
-from laya_onnx.export.export_fp32 import export_fp32        # noqa: E402
+from laya_onnx.export.export_fp32 import _copy_sidecars, _verify_opset, export_fp32   # noqa: E402
 from laya_onnx.session import OnnxSession                   # noqa: E402
 
 PASS, FAIL = [], []
@@ -55,6 +56,19 @@ try:
     model = tiny_model()
     path = export_fp32(model, os.path.join(tmp, "model.onnx"))
     check("export/file-exists", os.path.exists(path))
+
+    # The written artifact must really be opset 17, not merely have been asked for it. torch
+    # captures at 18 and down-converts through a best-effort version converter that is allowed
+    # to give up and leave the file at 18 without raising.
+    declared = [o.version for o in onnx.load(path).opset_import if o.domain in ("", "ai.onnx")]
+    check("export/opset-is-17", declared == [17], "got %s" % declared)
+
+    # ...and the guard that enforces it has to actually fire, or it is decoration.
+    try:
+        _verify_opset(path, 18)
+        check("export/opset-guard-raises", False, "accepted a 17 artifact as opset 18")
+    except RuntimeError:
+        check("export/opset-guard-raises", True)
 
     ids, att, mpos, mmask, qtype = sample()
     with torch.no_grad():
@@ -95,6 +109,26 @@ try:
     check("session/logits-match", float(np.abs(s_logits - o_logits).max()) < 1e-6)
     check("session/act-match", float(np.abs(s_act - o_act).max()) < 1e-6)
     check("session/float32", str(s_logits.dtype) == "float32", str(s_logits.dtype))
+
+    # Sidecars are required, not best-effort: an export directory without tokenizer/ is not
+    # self-contained and TokenizerAdapter would find nothing at serving time. No weights needed
+    # to test this - _copy_sidecars only ever looks at the filesystem.
+    ck, out = os.path.join(tmp, "ckpt"), os.path.join(tmp, "out")
+    os.makedirs(ck)
+    os.makedirs(out)
+    with open(os.path.join(ck, "rl_agent_config.json"), "w", encoding="utf-8") as f:
+        f.write("{}")
+    try:
+        _copy_sidecars(ck, out)
+        check("sidecars/missing-tokenizer-raises", False, "silently accepted a tokenizer-less checkpoint")
+    except FileNotFoundError as e:
+        check("sidecars/missing-tokenizer-raises", "tokenizer" in str(e), str(e)[:80])
+    os.makedirs(os.path.join(ck, "tokenizer"))
+    with open(os.path.join(ck, "tokenizer", "tokenizer.json"), "w", encoding="utf-8") as f:
+        f.write("{}")
+    _copy_sidecars(ck, out)
+    check("sidecars/copied", os.path.exists(os.path.join(out, "rl_agent_config.json"))
+          and os.path.exists(os.path.join(out, "tokenizer", "tokenizer.json")))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
