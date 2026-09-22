@@ -226,53 +226,60 @@ for sname, questions in SUITES.items():
         worst_act = max(worst_act, da)
         ok("numerics/%s/s%d/act-probs" % (sname, i), da < PROB_TOL, "max|d|=%.3e" % da)
 
+worst_prob = 0.0
+
+
+def compare_answers(prefix, t, o):
+    """Assert two answer dicts are the same answer, structurally and numerically."""
+    global worst_prob
+    ok("%s/same-question-ids" % prefix, set(t) == set(o),
+       "torch-only=%s onnx-only=%s" % (sorted(set(t) - set(o)), sorted(set(o) - set(t))))
+    for qid in sorted(set(t) & set(o)):
+        a, b = t[qid], o[qid]
+        ok("%s/%s/type" % (prefix, qid), a["type"] == b["type"])
+        # Structural identity, not just numeric agreement: a missing "legend" or a stray
+        # extra key is a contract break even when every number matches.
+        ok("%s/%s/keys" % (prefix, qid), set(a) == set(b),
+           "torch-only=%s onnx-only=%s" % (sorted(set(a) - set(b)), sorted(set(b) - set(a))))
+        if a["type"] == "choice":
+            # A changed argmax on fp32 would mean the export is wrong, not imprecise, so this
+            # is an equality and not a tolerance.
+            ok("%s/%s/choice" % (prefix, qid), a["choice"] == b["choice"],
+               "torch=%r onnx=%r" % (a["choice"], b["choice"]))
+            d = max(abs(a["probabilities"][k] - b["probabilities"][k]) for k in a["probabilities"])
+        elif a["type"] == "score":
+            ok("%s/%s/legend" % (prefix, qid), a.get("legend") == b.get("legend"))
+            d = abs(a["score"] - b["score"])
+        else:
+            d = abs(a["noul"] - b["noul"])
+        worst_prob = max(worst_prob, d)
+        ok("%s/%s/value<%g" % (prefix, qid, PROB_TOL), d < PROB_TOL, "|d|=%.3g" % d)
+        ok("%s/%s/confidence<%g" % (prefix, qid, PROB_TOL),
+           abs(a["confidence"] - b["confidence"]) < PROB_TOL,
+           "|d|=%.3g" % abs(a["confidence"] - b["confidence"]))
+
+
 # ------------------------------------------------- 3. full-pipeline parity
 head("3. Pipeline parity: laya.predict vs laya_onnx.predict")
-worst_prob = 0.0
 for sname, questions in SUITES.items():
     for i, state in enumerate(STATES):
-        t = torch_agent.predict(state, questions)["answers"]
-        o = onnx_agent.predict(state, questions)["answers"]
-        ok("%s/s%d/same-question-ids" % (sname, i), set(t) == set(o),
-           "torch-only=%s onnx-only=%s" % (sorted(set(t) - set(o)), sorted(set(o) - set(t))))
-        for qid in sorted(set(t) & set(o)):
-            a, b = t[qid], o[qid]
-            ok("%s/s%d/%s/type" % (sname, i, qid), a["type"] == b["type"])
-            # Structural identity, not just numeric agreement: a missing "legend" or a stray
-            # extra key is a contract break even when every number matches.
-            ok("%s/s%d/%s/keys" % (sname, i, qid), set(a) == set(b),
-               "torch-only=%s onnx-only=%s" % (sorted(set(a) - set(b)), sorted(set(b) - set(a))))
-            if a["type"] == "choice":
-                ok("%s/s%d/%s/choice" % (sname, i, qid), a["choice"] == b["choice"],
-                   "torch=%r onnx=%r" % (a["choice"], b["choice"]))
-                d = max(abs(a["probabilities"][k] - b["probabilities"][k])
-                        for k in a["probabilities"])
-            elif a["type"] == "score":
-                ok("%s/s%d/%s/legend" % (sname, i, qid), a.get("legend") == b.get("legend"))
-                d = abs(a["score"] - b["score"])
-            else:
-                d = abs(a["noul"] - b["noul"])
-            worst_prob = max(worst_prob, d)
-            ok("%s/s%d/%s/value<%g" % (sname, i, qid, PROB_TOL), d < PROB_TOL, "|d|=%.3g" % d)
-            ok("%s/s%d/%s/confidence<%g" % (sname, i, qid, PROB_TOL),
-               abs(a["confidence"] - b["confidence"]) < PROB_TOL,
-               "|d|=%.3g" % abs(a["confidence"] - b["confidence"]))
+        compare_answers("%s/s%d" % (sname, i),
+                        torch_agent.predict(state, questions)["answers"],
+                        onnx_agent.predict(state, questions)["answers"])
 
 # ------------------------------------------------- 4. non-Latin script
 head("4. mmBERT reads non-Latin scripts")
 # The whole reason the router exists is that the English checkpoint collapses off English
 # while staying confident. This port is the multilingual one, so Devanagari must produce a
-# full answer set rather than an exception -- and must agree with torch on it.
-DEV = {"body": "मुझसे इनवॉइस 4411 "
-               "के लिए दो बार "
-               "शुल्क लिया गया।"}
+# full answer set rather than an exception -- and the ONNX path must agree with torch on it
+# just as closely as it does on English. Given the Gemma tokenizer, this is also the case
+# where a special-token or byte-level encoding divergence would show up first, which is why
+# it gets the same full comparison rather than a smoke test.
+DEV = {"body": "मुझसे इनवॉइस 4411 के लिए दो बार शुल्क लिया गया।"}
 dev_o = onnx_agent.predict(DEV, SUITES["triage"])["answers"]
-dev_t = torch_agent.predict(DEV, SUITES["triage"])["answers"]
-ok("devanagari/answers-every-question", set(dev_o) == set(SUITES["triage"]))
-ok("devanagari/agrees-with-torch",
-   all(dev_t[q].get("choice") == dev_o[q].get("choice") for q in dev_t),
-   "torch=%s onnx=%s" % ({q: dev_t[q].get("choice") for q in dev_t},
-                         {q: dev_o[q].get("choice") for q in dev_o}))
+ok("devanagari/answers-every-question", set(dev_o) == set(SUITES["triage"]),
+   "got %s" % sorted(dev_o))
+compare_answers("devanagari", torch_agent.predict(DEV, SUITES["triage"])["answers"], dev_o)
 
 # ------------------------------------------------- 5. the budget claim, measured
 head("5. Token budget: does a real code state fit in 1024/256?")
