@@ -35,9 +35,13 @@ from laya_onnx.bench.eval_ece import (                                       # n
     temperature_for,
 )
 from laya_onnx.export.quantize_int8 import (                                 # noqa: E402
+    _BODY_OP_TYPES,
+    _EMBEDDING_INITIALIZER,
     _require_external_data,
     _strip_initializer_value_info,
+    assert_embeddings_not_quantized,
     quantize,
+    quantized_initializers,
 )
 from laya_onnx.export.refit_temps import (                                   # noqa: E402
     RAW_T_MIN,
@@ -258,6 +262,74 @@ with tempfile.TemporaryDirectory() as d:
                "staged at %r" % staged)
     check("strip/initializer-survives", [t.name for t in onnx.load(staged).graph.initializer],
           ["W"])
+
+# --------------------------------------------------- the embedding-table exclusion
+# The default `op_types_to_quantize` includes `Gather`, and this checkpoint's only large
+# `Gather` operand is the 256k-row token-embedding table, which gets quantized per-tensor --
+# one scale and one zero-point for 256,000 rows. `quantize_embeddings=False` restricts the op
+# set to MatMul so that table stays fp32.
+#
+# It is worth being clear about what these tests do and do not certify. Sparing the table was
+# measured and does **not** recover accuracy (`noul:2` lands on 0.7800 either way against
+# fp32's 0.8833) -- see point 4 of quantize_int8's docstring. What is asserted below is only
+# that the exclusion *happens*, verified from the written graph rather than from the flag that
+# was passed, because that is what made the comparison trustworthy: a flag that silently did
+# nothing would have produced two identical graphs and a confident null result.
+check("exclusion/only-matmul-is-quantized", list(_BODY_OP_TYPES), ["MatMul"])
+
+
+def _emb_graph(embedding_tensor, extra=()):
+    """A one-node graph carrying `embedding_tensor` (or nothing) as its embedding initializer."""
+    inits = ([embedding_tensor] if embedding_tensor is not None else []) + list(extra)
+    g = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Y"])], "g",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        initializer=inits)
+    return helper.make_model(g)
+
+
+with tempfile.TemporaryDirectory() as d:
+    ok_path = os.path.join(d, "ok.onnx")
+    body_weight = helper.make_tensor("val_1_quantized", TensorProto.INT8, [2, 2],
+                                     bytes([1, 2, 3, 4]), raw=True)
+    onnx.save(_emb_graph(
+        helper.make_tensor(_EMBEDDING_INITIALIZER, TensorProto.FLOAT, [2, 2],
+                           [1.0, 2.0, 3.0, 4.0]),
+        extra=[body_weight]), ok_path)
+    try:
+        assert_embeddings_not_quantized(ok_path)
+        PASS.append("exclusion/fp32-embedding-passes")
+    except RuntimeError as e:
+        FAIL.append("exclusion/fp32-embedding-passes: raised %r" % (e,))
+    # The body weight must still register as quantized -- an "exclusion" that excluded
+    # everything would also pass the check above, and would be a 1290 MB "int8" model.
+    check("exclusion/body-weight-still-reported-quantized",
+          [(n, dt) for n, dt, _ in quantized_initializers(ok_path)],
+          [("val_1_quantized", "INT8")])
+
+    bad_path = os.path.join(d, "bad.onnx")
+    onnx.save(_emb_graph(helper.make_tensor(
+        _EMBEDDING_INITIALIZER + "_quantized", TensorProto.UINT8, [2, 2],
+        bytes([1, 2, 3, 4]), raw=True)), bad_path)
+    try:
+        assert_embeddings_not_quantized(bad_path)
+        FAIL.append("exclusion/quantized-embedding-raises: no raise")
+    except RuntimeError as e:
+        check_true("exclusion/quantized-embedding-raises", "token-embedding" in str(e),
+                   "message was %r" % str(e))
+
+    # A graph this check does not recognise must fail loudly rather than vacuously pass: a
+    # silent pass would be a guard that certifies every unknown model as safe.
+    unknown = os.path.join(d, "unknown.onnx")
+    onnx.save(_emb_graph(None), unknown)
+    try:
+        assert_embeddings_not_quantized(unknown)
+        FAIL.append("exclusion/unknown-graph-raises: no raise")
+    except RuntimeError as e:
+        check_true("exclusion/unknown-graph-raises", _EMBEDDING_INITIALIZER in str(e),
+                   "message was %r" % str(e))
+
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:

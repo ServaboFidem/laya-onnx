@@ -15,7 +15,7 @@ and the temperature refit that can repair it lives in `laya_onnx/export/refit_te
 this module without running those is exactly the failure mode laya exists to avoid -- a model
 that picks the right label and lies about how sure it is.
 
-Three mechanical points about *this* graph, each of which costs a confusing failure if ignored:
+Four mechanical points about *this* graph, each of which costs a confusing failure if ignored:
 
 1. **The fp32 export is a two-file artifact.** `export_fp32` writes `model.onnx` (~2.8 MB of
    graph) plus `model.onnx.data` (~1.29 GB of weights): torch's exporter externalizes the
@@ -56,6 +56,38 @@ Three mechanical points about *this* graph, each of which costs a confusing fail
    compression at all. Restricting the rewrite to MatMuls with a constant B keeps it to the
    linear layers, which is where the 1.29 GB actually lives.
 
+4. **`quantize_embeddings` controls the token-embedding table, and neither setting rescues
+   this checkpoint.** `quantize_dynamic`'s default `op_types_to_quantize` is every key of ONNX
+   Runtime's `IntegerOpsRegistry`, which includes `Gather`. This graph's single `Gather` named
+   `node_embedding` reads `model.encoder.embeddings.tok_embeddings.weight`, a [256000, 768]
+   table holding ~196M of the checkpoint's ~322M parameters, and quantizing a `Gather` operand
+   is *per-tensor*: the written graph carries a scalar `..._scale` and `..._zero_point`, one
+   pair for all 256,000 rows.
+
+   That looks like an obvious culprit for the accuracy damage int8 does here, and it was
+   tested as one. **It is not the cause.** Both configurations were measured on the same 1500
+   labelled examples and the same held-out split, with an identical body (100 `MatMulInteger`
+   nodes either way -- the only difference between the two graphs is the embedding table):
+
+     - `noul:2` held-out accuracy is **0.7800 either way**, against fp32's 0.8833.
+     - Per suite, sparing the table made `toxic_chat` *worse* (0.5733 -> 0.5400) and `emotion`
+       slightly better (0.5000 -> 0.5100); fp32-agreement on `toxic_chat` fell 0.7300 -> 0.6967.
+     - Max absolute logit deviation from fp32 stayed in the same 6-19 nat range.
+
+   So the damage lives in the body's 100 quantized linear layers, not in the embedding lookup.
+   Calibration survives either way (after a temperature refit, ECE is within 0.02 of fp32 in
+   every bucket); the labels do not. `laya_onnx/README.md` carries the full three-way table and
+   the conclusion, which is to ship fp32.
+
+   The default is nonetheless `quantize_embeddings=False`. Not because it recovers accuracy --
+   it does not, and no comment here should be read as claiming otherwise -- but because a
+   single scale spanning 196M parameters is indefensible on its face, the exclusion costs no
+   body quantization at all, and the size it costs is moot for a configuration that is not
+   recommended for shipping. It restricts the op set to `MatMul`, the only registry entry this
+   graph contains besides `Gather` and `Transpose` (`Transpose` being a no-op unless its input
+   is already quantized). Size: 1290.5 MB fp32 -> 324.7 MB quantizing everything -> 914.6 MB
+   sparing the table.
+
 Only the weights shrink; the graph, the config and the tokenizer are copied through unchanged,
 so an int8 export directory loads with the same `laya_onnx.load()` as the fp32 one.
 """
@@ -65,6 +97,20 @@ import shutil
 
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
+
+_SUMMARY = "Dynamic int8 quantization of an fp32 laya-onnx export."
+
+# The one registry op this graph should be quantized through. See point 4 of the module
+# docstring: the default set also contains `Gather`, and this graph's only `Gather` over a large
+# initializer is the 256k-row token-embedding table, whose per-tensor quantization is what broke
+# the first export. `Transpose` is also in the default set but is a no-op unless its input is
+# already quantized, so naming MatMul alone loses nothing measurable here.
+_BODY_OP_TYPES = ["MatMul"]
+
+# The initializer that must stay fp32 when `quantize_embeddings` is False. Named explicitly so
+# `assert_embeddings_not_quantized` can prove it from the *written* graph rather than trusting
+# that the op-type restriction did what it was supposed to.
+_EMBEDDING_INITIALIZER = "model.encoder.embeddings.tok_embeddings.weight"
 
 _MODEL = "model.onnx"
 _CONFIG = "rl_agent_config.json"
@@ -114,7 +160,60 @@ def _strip_initializer_value_info(onnx_path: str) -> str:
     return staged
 
 
-def quantize(fp32_path: str, int8_path: str) -> str:
+def quantized_initializers(onnx_path: str) -> list:
+    """`(name, onnx dtype name, dims)` for every initializer the quantizer rewrote.
+
+    ONNX Runtime writes a quantized weight as a new initializer named `<original>_quantized`
+    and drops the fp32 original, so the suffix is a reliable marker of what was actually
+    touched. Reported by the CLI because "which tensors became int8" is the one question the
+    size number cannot answer -- a 3.97x shrink looks like a success whether it came from the
+    100 body MatMuls or from crushing a 256k-row embedding table into one scale.
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+    out = []
+    for t in model.graph.initializer:
+        if t.name.endswith("_quantized"):
+            out.append((t.name, onnx.TensorProto.DataType.Name(t.data_type), list(t.dims)))
+    return out
+
+
+def assert_embeddings_not_quantized(onnx_path: str) -> None:
+    """Raise unless the token-embedding table survived in fp32 in the *written* graph.
+
+    This is deliberately a check on the artifact, not on the arguments that produced it. The
+    op-type restriction is an instruction to a third-party quantizer; whether it was honoured
+    is a property of the file. "We passed the right flag" and "the flag took effect" are
+    different claims, and only the second one is checkable here -- which is the whole reason
+    the exclusion experiment in point 4 could be trusted to have actually excluded anything.
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+    by_name = {t.name: t for t in model.graph.initializer}
+
+    bad = by_name.get(_EMBEDDING_INITIALIZER + "_quantized")
+    if bad is not None:
+        raise RuntimeError(
+            "%r quantized the token-embedding table: found initializer %r with dtype %s and "
+            "shape %s. That is a per-tensor quantization of ~196M parameters across 256k rows "
+            "sharing one scale, which on this checkpoint flips the predicted label on roughly "
+            "a quarter of inputs. The op-type restriction did not take effect."
+            % (onnx_path, bad.name, onnx.TensorProto.DataType.Name(bad.data_type),
+               list(bad.dims)))
+
+    kept = by_name.get(_EMBEDDING_INITIALIZER)
+    if kept is None:
+        raise RuntimeError(
+            "%r has no initializer named %r at all, quantized or otherwise. This check knows "
+            "the multilingual (mmBERT) export's tensor names; it cannot vouch for a graph it "
+            "does not recognise, and silently passing would be worse than failing."
+            % (onnx_path, _EMBEDDING_INITIALIZER))
+    if kept.data_type != onnx.TensorProto.FLOAT:
+        raise RuntimeError(
+            "%r's %r is %s, not FLOAT."
+            % (onnx_path, _EMBEDDING_INITIALIZER,
+               onnx.TensorProto.DataType.Name(kept.data_type)))
+
+
+def quantize(fp32_path: str, int8_path: str, quantize_embeddings: bool = False) -> str:
     """Write an int8 copy of an fp32 export. Returns `int8_path`.
 
     Both arguments may be either a `model.onnx` file or a whole export *directory*. The
@@ -123,6 +222,13 @@ def quantize(fp32_path: str, int8_path: str) -> str:
     something no agent can load, and both the ECE measurement and the temperature refit that
     must follow this step work on loadable agents. When `fp32_path` is a directory, the config
     and tokenizer are copied into `int8_path` alongside the quantized graph.
+
+    `quantize_embeddings=False` (the default) restricts the rewrite to `MatMul`, leaving the
+    256k-row token-embedding table in fp32. Passing True reproduces `quantize_dynamic`'s stock
+    behaviour. **Both were measured and neither preserves this checkpoint's accuracy** -- the
+    `noul:2` bucket lands on 0.7800 either way against fp32's 0.8833. See point 4 of the module
+    docstring: the parameter exists so that comparison stays reproducible, and the default is
+    the more conservative graph rather than a fix.
     """
     as_dir = os.path.isdir(fp32_path)
     src_model = os.path.join(fp32_path, _MODEL) if as_dir else fp32_path
@@ -142,6 +248,9 @@ def quantize(fp32_path: str, int8_path: str) -> str:
             staged,
             dst_model,
             weight_type=QuantType.QInt8,
+            # Point 4: restricting the op set is what spares the token-embedding table. Passing
+            # None here means "every IntegerOpsRegistry key", which includes Gather.
+            op_types_to_quantize=None if quantize_embeddings else list(_BODY_OP_TYPES),
             # See the module docstring: this confines the rewrite to MatMuls with a constant B
             # (the linear layers), leaving the attention activation-by-activation products in
             # fp32.
@@ -150,6 +259,14 @@ def quantize(fp32_path: str, int8_path: str) -> str:
     finally:
         if os.path.exists(staged):
             os.remove(staged)
+
+    # Prove it from the written graph rather than trusting the op-type restriction. An
+    # op_types_to_quantize that silently stopped covering this case would otherwise produce a
+    # model that loads, answers, and is wrong on a quarter of inputs -- which is exactly the
+    # failure this default exists to prevent, and exactly the kind that no structural test
+    # catches.
+    if not quantize_embeddings:
+        assert_embeddings_not_quantized(dst_model)
 
     if as_dir:
         # The quantized graph is useless on its own: OnnxAgent.__init__ raises unless
@@ -169,6 +286,13 @@ def quantize(fp32_path: str, int8_path: str) -> str:
     return int8_path
 
 
+def _numel(dims) -> int:
+    n = 1
+    for d in dims:
+        n *= d
+    return n
+
+
 def _size_on_disk(path: str) -> int:
     """Total bytes of a model, counting any external-data sibling. A quantized model that keeps
     its weights external would otherwise look like a 3 MB file next to a 1.3 GB one."""
@@ -178,14 +302,30 @@ def _size_on_disk(path: str) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # `__doc__` is None under `python -OO`, which strips docstrings; `.splitlines()[0]` on it is
+    # an AttributeError that only ever appears in an optimized run, i.e. the one place nobody
+    # tests. _SUMMARY is the same sentence as a real constant.
+    ap = argparse.ArgumentParser(description=_SUMMARY)
     ap.add_argument("fp32", help="fp32 export directory (or model.onnx path)")
     ap.add_argument("int8", help="destination directory (or model.onnx path)")
+    ap.add_argument("--quantize-embeddings", action="store_true",
+                    help="also quantize the token-embedding table (stock quantize_dynamic "
+                         "behaviour). Smaller, and measured to be no worse for accuracy than "
+                         "excluding it -- see point 4 of this module's docstring; neither "
+                         "configuration is recommended for shipping.")
     a = ap.parse_args(argv)
-    out = quantize(a.fp32, a.int8)
+    out = quantize(a.fp32, a.int8, quantize_embeddings=a.quantize_embeddings)
     before, after = _size_on_disk(a.fp32), _size_on_disk(out)
     print("fp32 %.1f MB -> int8 %.1f MB (%.2fx)"
           % (before / 1e6, after / 1e6, before / max(after, 1)))
+
+    model_path = os.path.join(out, _MODEL) if os.path.isdir(out) else out
+    quantized = quantized_initializers(model_path)
+    print("%d initializers quantized; largest:" % len(quantized))
+    for name, dtype, dims in sorted(quantized, key=lambda x: -_numel(x[2]))[:5]:
+        print("   %-8s %-16s %s" % (dtype, dims, name))
+    print("token-embedding table quantized: %s" % a.quantize_embeddings)
+
     print("Quantizing is not the end of this job: measure ECE against the int8 graph "
           "(laya_onnx/bench/eval_ece.py) before shipping it.")
     return 0
