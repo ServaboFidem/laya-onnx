@@ -59,3 +59,16 @@ graft/
 # Subagent-driven-development scratch workspace (ledgers, briefs, review packages).
 # Ephemeral coordination state, not source.
 .superpowers/
+
+# Model artifacts. .gitattributes marks these `binary`, which governs diffing and language
+# stats only -- nothing there stops a commit. The exporter writes ~1.3 GB (model.onnx plus the
+# sibling model.onnx.data that carries the weights past protobuf's 2 GB ceiling), and the
+# documented output path is ~/laya_onnx_models, outside the tree. But `--out ./model` is one
+# keystroke away from staging that, and the repo's history already carries a lesson about what
+# survives in main, so name them here rather than rely on where someone happened to point it.
+*.onnx
+*.onnx.data
+*.onnx_data
+*.safetensors
+laya_models/
+laya_onnx_models/

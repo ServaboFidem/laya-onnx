@@ -54,7 +54,7 @@ class ExportWrapper(torch.nn.Module):
 
 
 def _verify_opset(path: str, want: int) -> int:
-    """Raise unless the file at `path` really declares opset `want` for the default domain.
+    """Raise unless the file at `path` really declares opset `want` *and* validates against it.
 
     `opset_version=` is a request, not a guarantee. torch.export captures at its own opset (18
     at the time of writing) and then asks a version converter to walk the graph back down. That
@@ -84,6 +84,35 @@ def _verify_opset(path: str, want: int) -> int:
             "not take here. Re-export with --opset %s, or fix the converter, rather than "
             "shipping an artifact whose opset nobody agrees on." % (path, got, want, got[0])
         )
+
+    # Matching the declared opset is necessary but NOT sufficient, and the difference is not
+    # theoretical: exporting the real multilingual checkpoint at opset 17 produced a file that
+    # declared opset 17 and passed the check above, while containing
+    #     Split(..., num_outputs=2)
+    # - an attribute Split only gained in opset 18. The C API fallback converter had rewritten
+    # the *header* to 17 and left that node untouched, so the artifact was internally
+    # inconsistent: every downstream tool that trusts the header rejects it. onnxruntime's
+    # rejection is the one that matters, and it arrives at *load* time on the serving host:
+    #     INVALID_GRAPH : ... Unrecognized attribute: num_outputs for operator Split
+    # onnx.checker validates each node against the schema for the declared opset and catches
+    # exactly this, here, on the machine doing the export. It is preferred over an
+    # onnxruntime load because the exporter must not acquire a runtime dependency just to
+    # check itself, and because the checker names the offending node rather than the file.
+    #
+    # `check_model` is given the path, not the loaded proto: these graphs exceed the 2 GB
+    # protobuf ceiling and carry their weights in a sibling `.data` file, which only the
+    # path-taking form knows how to resolve.
+    try:
+        onnx.checker.check_model(path, full_check=False)
+    except onnx.checker.ValidationError as exc:
+        raise RuntimeError(
+            "exported %s declares opset %d but does not validate against it: %s. "
+            "This is the down-converter having relabelled the graph without actually "
+            "converting every node. The file loads nowhere -- onnxruntime rejects it as "
+            "INVALID_GRAPH at session creation. Re-export at an opset the capture can reach "
+            "natively (torch.export captures at 18) rather than shipping it."
+            % (path, want, exc)
+        ) from exc
     return got[0]
 
 

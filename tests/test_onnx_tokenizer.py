@@ -1,11 +1,20 @@
 """TokenizerAdapter exposes the slice of the HF tokenizer API build_sequence needs,
 backed by `tokenizers` alone so the runtime never imports transformers.
 
-Two cases beyond the brief close a spec gap (see the project's risk table on the Gemma
-tokenizer): the adapter must sidestep tokenizer_config.json entirely, even when that file
-has the exact shape (`extra_special_tokens` as a list) that breaks transformers' own
-AutoTokenizer for mmBERT/Gemma checkpoints (see laya/agent.py:39-45); and both shapes of
-special_tokens_map.json -- bare string and {"content": ..., ...} dict -- must resolve.
+Several cases beyond the brief close a spec gap around special-token resolution, which is
+where this adapter met the real multilingual checkpoint and lost:
+
+  - the adapter must read special-token names from BOTH special_tokens_map.json and
+    tokenizer_config.json, with tokenizer_config.json winning, because that is transformers'
+    own precedence and because `convaiinnovations/laya` @ multilingual ships no
+    special_tokens_map.json at all -- its `<bos>`/`<eos>`/`<mask>`/`<pad>` live only in
+    tokenizer_config.json. Reading only the map file left the adapter on the BERT-shaped
+    defaults and it died on "special token '[MASK]' is not in this tokenizer's vocabulary".
+  - reading tokenizer_config.json must NOT reintroduce the Gemma quirk that breaks
+    transformers' AutoTokenizer for mmBERT/Gemma checkpoints (`extra_special_tokens` as a
+    list -> "'list' object has no attribute 'keys'", see laya/agent.py:39-45). Nothing here
+    looks at that key, so it cannot; the test below holds that line.
+  - both shapes of a declared token -- bare string and {"content": ..., ...} dict -- resolve.
 """
 import json
 import os
@@ -146,9 +155,10 @@ finally:
 # --- Case: Gemma tokenizer_config.json quirk (extra_special_tokens as a list) ---------
 tmp3 = make_gemma_quirk_checkpoint(tempfile.mkdtemp())
 try:
-    # Constructing must not raise -- if the adapter ever read tokenizer_config.json the
-    # way transformers' AutoTokenizer does, this would blow up on the list-shaped
-    # extra_special_tokens with "'list' object has no attribute 'keys'".
+    # Constructing must not raise. The adapter does read tokenizer_config.json, but only for
+    # the four special-token names -- it never touches `extra_special_tokens`, so the list
+    # shape that makes transformers' AutoTokenizer blow up with "'list' object has no
+    # attribute 'keys'" is simply not on any path it walks.
     tok3 = TokenizerAdapter(tmp3)
     check("gemma-quirk/mask_token", tok3.mask_token, "[MASK]")
     check("gemma-quirk/mask_id", tok3.mask_token_id, 4)
@@ -163,6 +173,66 @@ try:
     check("gemma-quirk/build_sequence-ends-with-sep", ids3[-1], 3)
 finally:
     shutil.rmtree(tmp3, ignore_errors=True)
+
+# ------------------------------------------------------------------ special-token sourcing
+# Regression cases from Task 8: the real multilingual checkpoint ships tokenizer.json and
+# tokenizer_config.json and nothing else, so special_tokens_map.json cannot be the only source.
+
+# (a) names declared ONLY in tokenizer_config.json must resolve.
+tmp4 = tempfile.mkdtemp()
+try:
+    tokdir4 = os.path.join(tmp4, "tokenizer")
+    make_vocab_tokenizer(tokdir4)
+    with open(os.path.join(tokdir4, "tokenizer_config.json"), "w") as f:
+        json.dump({"pad_token": "[PAD]", "cls_token": "[CLS]", "sep_token": "[SEP]",
+                   "mask_token": "[MASK]", "tokenizer_class": "PreTrainedTokenizerFast"}, f)
+    tok4 = TokenizerAdapter(tmp4)
+    check("config-only/mask_id", tok4.mask_token_id, 4)
+    check("config-only/cls_id", tok4.cls_token_id, 2)
+    check("config-only/sep_id", tok4.sep_token_id, 3)
+    check("config-only/pad_id", tok4.pad_token_id, 0)
+finally:
+    shutil.rmtree(tmp4, ignore_errors=True)
+
+# (b) when both files declare a token, tokenizer_config.json wins -- transformers takes its
+# init kwargs from tokenizer_config.json and lets special_tokens_map.json fill only the gaps.
+# Getting this backwards would frame every sequence with the wrong token on any checkpoint
+# where the two files disagree, silently.
+tmp5 = tempfile.mkdtemp()
+try:
+    tokdir5 = os.path.join(tmp5, "tokenizer")
+    make_vocab_tokenizer(tokdir5)
+    with open(os.path.join(tokdir5, "special_tokens_map.json"), "w") as f:
+        json.dump({"cls_token": "[SEP]", "sep_token": "[SEP]", "pad_token": "[PAD]"}, f)
+    with open(os.path.join(tokdir5, "tokenizer_config.json"), "w") as f:
+        # disagrees with the map on cls_token, and is the only source for mask_token
+        json.dump({"cls_token": "[CLS]", "mask_token": "[MASK]"}, f)
+    tok5 = TokenizerAdapter(tmp5)
+    check("precedence/config-wins-on-cls", tok5.cls_token_id, 2)
+    check("precedence/config-supplies-mask", tok5.mask_token_id, 4)
+    check("precedence/map-fills-the-gap-sep", tok5.sep_token_id, 3)
+    check("precedence/map-fills-the-gap-pad", tok5.pad_token_id, 0)
+finally:
+    shutil.rmtree(tmp5, ignore_errors=True)
+
+# (c) a name no source can resolve is still fatal. Silently falling back to some other token
+# is the failure mode this whole area exists to prevent: it produces sequences framed with
+# the wrong tokens and answers that are confidently wrong, with no error anywhere.
+tmp6 = tempfile.mkdtemp()
+try:
+    tokdir6 = os.path.join(tmp6, "tokenizer")
+    make_vocab_tokenizer(tokdir6)
+    with open(os.path.join(tokdir6, "tokenizer_config.json"), "w") as f:
+        json.dump({"mask_token": "<not-in-this-vocab>"}, f)
+    raised = ""
+    try:
+        TokenizerAdapter(tmp6)
+    except ValueError as exc:
+        raised = str(exc)
+    check("unresolvable/raises-ValueError", raised.startswith("special token"), True)
+    check("unresolvable/names-the-token", "<not-in-this-vocab>" in raised, True)
+finally:
+    shutil.rmtree(tmp6, ignore_errors=True)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
