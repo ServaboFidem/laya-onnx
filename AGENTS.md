@@ -190,7 +190,8 @@ checkpoint as calibrated.
 
 **Latency is measured, and the answer depends on the thread count.** The host is a dual Xeon
 Gold 6148 (40 cores / 80 threads, two sockets), close to the opposite of the commodity hardware
-this port targets. At each library's *default* pool (onnxruntime 1.27.0, CPUExecutionProvider),
+this port targets. At each library's *default* pool (onnxruntime 1.27.0, CPUExecutionProvider;
+the declared floor is now 1.30.0, on which the shipped graph re-measures inside run-to-run spread),
 fp32 ONNX is 164.5 ms p50 at 1 question against torch's 175.4 ms measured the same way on the
 same machine, and **slower** above that: 1.40x at 5 questions, 1.81x at 50. Pin both to 4
 threads — the nearest this host gets to a CPU-quota'd container — and the loss is gone: 0.88x at

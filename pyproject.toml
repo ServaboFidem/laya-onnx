@@ -47,11 +47,14 @@ dependencies = [
 # transformers and `onnx` itself: the whole point of laya_onnx is a process that holds none of
 # them, and tests/test_onnx_no_torch.py fails the build if one creeps back in. numpy is already a
 # core dependency and is repeated here only so this extra reads as a complete description of what
-# the runtime needs. These floors are the ones declared in the port's plan, not measured here;
-# what *is* measured is that the shipped export runs on onnxruntime 1.27.0, tokenizers 0.22.2 and
-# numpy 2.3.4 (laya_onnx/README.md's benchmark table records the exact environment).
+# the runtime needs. The onnxruntime floor is a measured one, not a minimum: 1.30.0 is the
+# release the eight offline ONNX suites and the shipped export's latency were last run on
+# (laya_onnx/README.md records both environments it has been measured in). Older releases are
+# untested here rather than known to fail. The tokenizers and numpy floors are still the port
+# plan's; what *is* measured is that the shipped export runs on tokenizers 0.22.2 and
+# numpy 2.3.4.
 onnx = [
-    "onnxruntime>=1.17",
+    "onnxruntime>=1.30",
     "tokenizers>=0.15",
     "numpy>=1.20.0",
 ]
@@ -65,7 +68,7 @@ onnx = [
 onnx-export = [
     "onnx>=1.23",
     "onnxscript>=0.7",
-    "onnxruntime>=1.17",
+    "onnxruntime>=1.30",
     "torch>=2.10",
     "transformers>=4.48.0",
 ]

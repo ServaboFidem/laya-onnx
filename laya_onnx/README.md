@@ -80,6 +80,25 @@ close to the worst case for onnxruntime's default thread pool, which sizes itsel
 physical core and then pays NUMA traffic for the privilege; a 4-core container will produce a
 different shape of curve, not just a shifted one.
 
+**The declared floor is onnxruntime 1.30.0, and the tables were taken on 1.27.0.** Both are
+true and neither is a contradiction: the floor is the release everything here was last *run*
+on (the eight offline suites, and the shipped graph re-measured below), and the tables are left
+as measured rather than re-taken, because re-taking them changed nothing. The shipped graph on
+1.30.0, same host, same protocol as the 4-thread table (3 warmup / 20 timed):
+
+| threads | questions per call | 1.27.0 p50 | 1.30.0 p50 |
+|---|---|---|---|
+| 4 | 1 | 231.3 ms | 235.3 ms |
+| 4 | 5 | 1177.7 ms | 1164.5 ms |
+| 4 | 10 | 2474.8 ms | 2316.4 ms |
+| default | 1 | 149.5 ms | 158.1 ms |
+| default | 5 | 641.0 ms | 666.4 ms |
+| default | 10 | 1226.3 ms | 1249.0 ms |
+
+Every row but one sits inside the run-to-run spread documented above, and that one (4 threads,
+10 questions, 6%) is a single pair of runs. So the bump is a testing baseline, not a speed win;
+an earlier one-off run that suggested 8–10% did not survive a clean repeat, and is not claimed.
+
 fp32, onnxruntime's default thread count:
 
 | questions per call | p50 ms | p95 ms |
