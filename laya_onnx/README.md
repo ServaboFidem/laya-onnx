@@ -12,8 +12,11 @@ The fp32 export is verified against the torch path on real weights: max |delta| 
 
 `laya_onnx/export/quantize_int8.py` produces a dynamically quantized int8 copy of an fp32
 export. It works, and it is up to 3.97x smaller. **Ship fp32 anyway.** The reason is in the
-tables below, and it is not the one you would expect: the calibration survives quantization,
-and the *accuracy* does not.
+tables below, and it is not the one you would expect: **the accuracy is what breaks.** Paired
+McNemar puts the `noul:2` accuracy loss at p = 1.6e-06 and the pooled loss over 750 held-out
+rows at p = 3.1e-05. ECE, meanwhile, does not distinguish the graphs at this sample size at
+all — so the failure is in the labels, not in the calibration that a temperature refit could
+repair.
 
 Two int8 configurations were measured, not one, on the same data and the same held-out split:
 
@@ -116,7 +119,11 @@ decimal places invites comparisons that `n` does not support. So the noise is me
 
 **95% percentile-bootstrap intervals** (2000 resamples, seeded; the bootstrap rather than a
 closed form because ECE is a sum over occupied bins of |mean confidence − mean accuracy| and
-both the occupancy and the within-bin means are random):
+both the occupancy and the within-bin means are random). These are **not symmetric about the
+point estimate and for ECE they lean high** — a sum of absolute values is bounded below by 0
+and unbounded above, so resampling inflates a bin gap further than it cancels one, which is why
+every ECE estimate below sits at or just above its lower bound. Read the upper end as "how bad
+could this be", not as a symmetric error bar:
 
 | bucket | n | accuracy fp32 / int8-all / int8-body | ECE fp32 / int8-all / int8-body |
 |---|---|---|---|
@@ -125,21 +132,48 @@ both the occupancy and the within-bin means are random):
 | `choice:11+` | 150 | 0.680 [0.607, 0.747] / 0.727 [0.653, 0.793] / 0.693 [0.620, 0.767] | 0.1159 [0.0960, 0.2052] / 0.1054 [0.0854, 0.1833] / 0.1048 [0.0895, 0.1904] |
 | `noul:2` | 300 | 0.883 [0.847, 0.920] / 0.780 [0.737, 0.827] / 0.780 [0.737, 0.827] | 0.0494 [0.0402, 0.0929] / 0.0658 [0.0448, 0.1112] / 0.0587 [0.0407, 0.1071] |
 
-**What ECE gap is even distinguishable here?** Resampling one graph's rows into two independent
-halves and taking |ECE_a − ECE_b| gives the distribution of a gap produced by sampling alone:
+**Is the ECE difference distinguishable?** The comparison is *paired*: both graphs answered the
+same questions, so their ECEs come from the same rows. `paired_ece_gap` therefore resamples row
+indices **once** and scores both graphs on the same resampled rows, and its permutation null
+exchanges each row's two `(confidence, correctness)` pairs with probability 1/2. Two answers per
+cell — a bootstrap CI on the signed gap `ECE_fp32 − ECE_int8`, and a permutation p-value against
+a null in which the graphs are interchangeable row by row:
 
-| bucket | n | 95th percentile of the null ECE gap |
-|---|---|---|
-| `choice:3-5` | 150 | 0.0330 |
-| `noul:2` | 300 | 0.0398 |
-| `choice:11+` | 150 | 0.0731 |
-| `choice:6-10` | 150 | 0.0821 |
+| bucket | n | fp32 vs int8-all: gap [95% CI], floor, p | fp32 vs int8-body: gap [95% CI], floor, p |
+|---|---|---|---|
+| `choice:3-5` | 150 | −0.0027 [−0.0412, +0.0215], 0.0288, p = 0.86 | **−0.0285** [−0.0533, **+0.0006**], 0.0256, **p = 0.030** |
+| `choice:6-10` | 150 | −0.0018 [−0.0763, +0.0756], 0.0697, p = 0.96 | −0.0347 [−0.1107, +0.0571], 0.0751, p = 0.38 |
+| `choice:11+` | 150 | +0.0106 [−0.0470, +0.0792], 0.0519, p = 0.70 | +0.0112 [−0.0498, +0.0775], 0.0584, p = 0.72 |
+| `noul:2` | 300 | −0.0164 [−0.0470, +0.0251], 0.0327, p = 0.33 | −0.0093 [−0.0419, +0.0299], 0.0303, p = 0.55 |
 
-**Every fp32-vs-int8 ECE gap in this study is smaller than its bucket's noise floor.** The
-largest is 0.0347 (`choice:6-10`, int8-body) against a floor of 0.0821. So ECE does not
-separate the three graphs at this sample size, and any statement of the form "int8 ECE is
-within X of fp32" for X in the 0.002–0.035 range is reporting measurement error. The
-defensible claim is the weaker one: **ECE is not where int8 fails.**
+"floor" is the 95th percentile of |gap| under the permutation null: the smallest gap that would
+be surprising at this `n`. A negative gap means int8 has the *higher* (worse) ECE.
+
+**Seven of the eight gaps sit below their floor. One does not.** `choice:3-5` on int8-body has
+|gap| = 0.0285 against a floor of 0.0256, permutation p = 0.030 — int8-body is *worse* calibrated
+than fp32 there. Three things keep that from overturning the conclusion, and none of them is
+that it is inconvenient:
+
+- its paired bootstrap CI still contains zero, by 0.0006;
+- it is one of **eight** comparisons. Under a global null the chance of at least one p < 0.05 is
+  1 − 0.95⁸ ≈ 0.34, and a Bonferroni threshold would be 0.00625. A single nominal p = 0.030 is
+  what this many tests produce by chance;
+- it is in `int8-body`, the configuration that is not recommended on any grounds.
+
+So the defensible claim is **ECE is not where int8 fails** — not the stronger "calibration
+survives", and not the blanket "every gap is below its floor" an earlier draft of this file
+asserted. Nothing here would have stopped int8 shipping; the accuracy result below is what does.
+
+> **Correction.** The floors in the previous revision (0.0330 / 0.0398 / 0.0731 / 0.0821) were
+> computed from two *independent* bootstrap resamples, one per graph. That discards the
+> covariance between two ECEs measured on identical rows and inflates the floor by roughly
+> 1.1–1.4x — and it meant this study used a paired test for accuracy and an unpaired null for
+> ECE in the same section. The prose also described the procedure as splitting rows "into two
+> independent halves", which was not what the code did (it drew two full-size samples). Both
+> are fixed; the floors above are paired and full-sample, and the statistic now lives in
+> `eval_ece.paired_ece_gap` with tests, rather than in an off-tree script. Tightening the floor
+> promoted exactly one cell from "below" to "marginally above", recorded above rather than
+> smoothed over.
 
 **Paired McNemar on accuracy** — paired because both graphs answered the same questions, so the
 two accuracies are strongly dependent and an unpaired test would overstate the variance. `b` is
@@ -162,8 +196,16 @@ drafts listed the per-bucket `choice` drops as though each were a finding; they 
 directionally consistent but individually within noise, and the recommendation rests on
 `noul:2` and the pooled result.
 
-Reproduce the intervals and tests from `laya_onnx.bench.eval_ece`'s `bootstrap_ci`,
-`paired_mcnemar`, `accuracy_of` and `ece_of`.
+Every interval, p-value and floor above is emitted by the driver itself:
+
+```bash
+python -m laya_onnx.bench.eval_ece --rows-in rows.npz --rows-keys fp32,int8_body
+```
+
+`--rows-in` reads the cached logits that `--rows-out` writes, so the whole statistical section
+re-derives **without the 1.3 GB checkpoint** — the underlying functions are `bootstrap_ci`,
+`paired_ece_gap`, `paired_mcnemar`, `accuracy_of` and `ece_of` in `laya_onnx.bench.eval_ece`,
+all unit-tested in `tests/test_onnx_calibration.py`.
 
 ### How faithful is the int8 graph, really?
 
@@ -200,14 +242,14 @@ property of dynamic int8 on this checkpoint.
 
 ### The conclusion
 
-- **No detectable ECE difference — which is a weaker claim than "calibration survives", and
-  is the one the sample size supports.** Every ECE gap between fp32 and either int8 build is
-  **below the noise floor at this n**. See the uncertainty section: the largest gap is 0.0347
-  (`choice:6-10`, int8-body) against a null-resampling 95th percentile of 0.0821 for that
-  bucket. ECE therefore does not distinguish the three graphs here, and an earlier draft of
-  this file claiming int8 ECE is "within 0.02 of fp32" was quoting a difference smaller than
-  the measurement error. What can be said: **ECE is not where int8 fails**, and nothing in the
-  calibration numbers would have stopped it shipping.
+- **ECE does not distinguish the three graphs at this sample size — a weaker claim than
+  "calibration survives", and the one the data supports.** Seven of the eight per-bucket gaps
+  sit below their own paired noise floor. The eighth (`choice:3-5`, int8-body: gap −0.0285,
+  floor 0.0256, permutation p = 0.030) is nominally above it, but its bootstrap CI still
+  contains zero and it is one of eight comparisons, where a single p = 0.030 is expected by
+  chance. An earlier draft claiming int8 ECE is "within 0.02 of fp32 in every bucket" was
+  quoting differences smaller than the measurement error. What can be said: **ECE is not where
+  int8 fails**, and nothing in the calibration numbers would have stopped int8 shipping.
 - **Argmax accuracy does not survive it, in either configuration — and unlike ECE, this one
   is significant.** `noul:2` drops 10.3 points, 0.8833 to 0.7800, over 300 held-out examples,
   landing on exactly 0.7800 whether the embedding table is quantized or not. Paired McNemar on

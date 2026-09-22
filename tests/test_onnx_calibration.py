@@ -42,9 +42,11 @@ from laya_onnx.bench.eval_ece import (                                       # n
     bootstrap_ci,
     bucket_metrics,
     collect_logits,
+    conf_correct,
     ece_of,
     measure_ece,
     metrics_from_rows,
+    paired_ece_gap,
     paired_mcnemar,
     split_rows,
     temperature_for,
@@ -592,6 +594,99 @@ check("bootstrap/no-variance-no-width",
 check("bootstrap/accuracy-is-temperature-free", accuracy_of(mixed_rows), 0.8)
 check("bootstrap/ece-matches-bucket-metrics", round(ece_of(noul_rows, 1.0), 4),
       bucket_metrics(noul_rows, [1.0, 1.0, 1.0], {})["ece"])
+
+
+# --------------------------------------------------- the paired ECE null
+# The statistic that carries this study's ECE retraction, so it has to be in the tree, tested,
+# and *correct*. The first version was neither in the tree nor correct: it drew two independent
+# bootstrap samples, one per graph, which throws away the covariance between two ECEs measured
+# on identical rows and reports a floor far wider than the real one. Using a paired test for
+# accuracy (McNemar) and an unpaired null for ECE in the same analysis was the tell.
+
+
+def _pair(logits_a, logits_b, gold, bucket="noul:2", qtype=None):
+    qt = QTYPES["noul"] if qtype is None else qtype
+    return (row(qt, len(logits_a), logits_a, gold, bucket),
+            row(qt, len(logits_b), logits_b, gold, bucket))
+
+
+# Two graphs that are literally identical: the gap is exactly 0, the CI must contain 0, and the
+# permutation test must be unable to reject.
+same_a, same_b = [], []
+for i in range(120):
+    ra, rb = _pair([0.0, 1.0 + 0.01 * i], [0.0, 1.0 + 0.01 * i], i % 2)
+    same_a.append(ra)
+    same_b.append(rb)
+ident = paired_ece_gap(same_a, same_b, 1.0, 1.0, n_boot=400, n_perm=400, seed=11)
+check("paired/identical-graphs-gap-is-zero", ident["gap"], 0.0)
+check("paired/identical-graphs-ci-contains-zero", ident["ci_excludes_zero"], False)
+check("paired/identical-graphs-zero-width-ci", ident["gap_ci"], [0.0, 0.0])
+check("paired/identical-graphs-null-floor-is-zero", ident["null_gap_p95"], 0.0)
+check_true("paired/identical-graphs-not-significant", ident["permutation_p"] > 0.05,
+           "p was %r" % ident["permutation_p"])
+
+# Pairing must actually tighten the interval. Two graphs whose confidences differ by a constant
+# on every row have a gap with almost no sampling variation once the rows are shared, while an
+# unpaired comparison would see two full-width ECE distributions. This is the whole point of
+# Open 3, so it is asserted rather than assumed: the paired CI must be narrower than the
+# unpaired difference-of-independent-bootstraps spread.
+shift_a, shift_b = [], []
+rng_s = np.random.default_rng(5)
+for i in range(200):
+    z = float(rng_s.normal(0.0, 1.5))
+    # graph B is uniformly a little more confident on the same rows
+    ra, rb = _pair([0.0, z], [0.0, z * 1.35], int(rng_s.random() < 0.7))
+    shift_a.append(ra)
+    shift_b.append(rb)
+paired = paired_ece_gap(shift_a, shift_b, 1.0, 1.0, n_boot=800, n_perm=800, seed=13)
+paired_width = paired["gap_ci"][1] - paired["gap_ci"][0]
+ind_a = bootstrap_ci(shift_a, lambda rr: ece_of(rr, 1.0), n_boot=800, seed=14)
+ind_b = bootstrap_ci(shift_b, lambda rr: ece_of(rr, 1.0), n_boot=800, seed=15)
+# A difference of two independent estimates spans at least the wider of the two margins; the
+# paired interval on the same data must beat that.
+unpaired_width = (ind_a[1] - ind_a[0]) + (ind_b[1] - ind_b[0])
+check_true("paired/ci-is-tighter-than-unpaired", paired_width < unpaired_width,
+           "paired %.4f vs unpaired %.4f" % (paired_width, unpaired_width))
+
+# Alignment is enforced the same way McNemar enforces it.
+try:
+    paired_ece_gap(same_a[:3], same_b[:4], 1.0, 1.0, n_boot=10, n_perm=10)
+    FAIL.append("paired/length-mismatch-raises: no raise")
+except ValueError:
+    PASS.append("paired/length-mismatch-raises")
+try:
+    paired_ece_gap([same_a[0]], [row(QTYPES["noul"], 2, [0.0, 1.0], 1 - same_a[0]["gold"],
+                                     "noul:2")], 1.0, 1.0, n_boot=10, n_perm=10)
+    FAIL.append("paired/misaligned-raises: no raise")
+except ValueError as e:
+    check_true("paired/misaligned-raises", "not aligned" in str(e), "message was %r" % str(e))
+try:
+    paired_ece_gap([], [], 1.0, 1.0)
+    FAIL.append("paired/empty-raises: no raise")
+except ValueError:
+    PASS.append("paired/empty-raises")
+
+# Deterministic from the seed, and the reported ECEs agree with the standalone estimator.
+check("paired/deterministic",
+      paired_ece_gap(shift_a, shift_b, 1.0, 1.0, n_boot=200, n_perm=200, seed=21),
+      paired_ece_gap(shift_a, shift_b, 1.0, 1.0, n_boot=200, n_perm=200, seed=21))
+check("paired/ece_a-matches-ece_of", paired["ece_a"], round(ece_of(shift_a, 1.0), 4))
+check("paired/ece_b-matches-ece_of", paired["ece_b"], round(ece_of(shift_b, 1.0), 4))
+# `gap` rounds the exact difference; comparing it to the difference of the two *already
+# rounded* ECEs double-rounds and can disagree by one unit in the last place. Tolerance, not
+# equality.
+check_true("paired/gap-is-a-minus-b",
+           abs(paired["gap"] - (paired["ece_a"] - paired["ece_b"])) <= 1e-4,
+           "gap %r vs %r - %r" % (paired["gap"], paired["ece_a"], paired["ece_b"]))
+# A permutation p-value from a finite number of draws can never justify 0.
+check_true("paired/permutation-p-is-never-zero", paired["permutation_p"] > 0.0)
+# Each graph keeps its own temperature through the swap.
+asym = paired_ece_gap(shift_a, shift_b, 1.0, 3.0, n_boot=200, n_perm=200, seed=22)
+check("paired/temperature-travels-with-its-graph", asym["ece_b"],
+      round(ece_of(shift_b, 3.0), 4))
+
+check("paired/conf-correct-shapes", [x.shape for x in conf_correct(shift_a, 1.0)],
+      [(200,), (200,)])
 
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))

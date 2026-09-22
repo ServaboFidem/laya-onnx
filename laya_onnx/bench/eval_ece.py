@@ -262,6 +262,14 @@ def bootstrap_ci(rows: Sequence[Dict[str, Any]], statistic, n_boot: int = 2000,
     reproduces exactly the sampling variation the reported number is subject to.
 
     Deterministic from `seed` so a published interval can be reproduced.
+
+    **These intervals are not symmetric about the point estimate, and for ECE they lean high.**
+    ECE is a weighted mean of |mean confidence - mean accuracy| over occupied bins: it is a sum
+    of absolute values, bounded below by 0 and unbounded above, so resampling can inflate a bin
+    gap much further than it can cancel one. In every bucket of this repository's study the
+    point estimate sits at or just above the lower bound. Read the upper end as "how bad could
+    this be", not as a symmetric error bar, and do not infer a standard error by halving the
+    width.
     """
     if not len(rows):
         return (float("nan"), float("nan"))
@@ -272,6 +280,103 @@ def bootstrap_ci(rows: Sequence[Dict[str, Any]], statistic, n_boot: int = 2000,
         idx = rng.integers(0, n, n)
         vals[i] = statistic([rows[j] for j in idx])
     return (float(np.quantile(vals, alpha / 2)), float(np.quantile(vals, 1 - alpha / 2)))
+
+
+def _require_aligned(rows_a: Sequence[Dict[str, Any]], rows_b: Sequence[Dict[str, Any]]) -> None:
+    """Both lists must be the same questions in the same order, or every paired statistic is
+    comparing unrelated answers to each other."""
+    if len(rows_a) != len(rows_b):
+        raise ValueError("paired statistics need paired rows: got %d and %d"
+                         % (len(rows_a), len(rows_b)))
+    for ra, rb in zip(rows_a, rows_b):
+        if ra["gold"] != rb["gold"] or ra["bucket"] != rb["bucket"]:
+            raise ValueError("rows are not aligned: %r/%r vs %r/%r"
+                             % (ra["bucket"], ra["gold"], rb["bucket"], rb["gold"]))
+
+
+def conf_correct(rows: Sequence[Dict[str, Any]], t: float) -> Tuple[np.ndarray, np.ndarray]:
+    """`(top-1 confidence, correctness)` per row at temperature `t` -- the two vectors ECE is a
+    function of. Computed once so the resampling loops below are array indexing rather than
+    thousands of softmaxes."""
+    conf = np.asarray([float(_softmax(r["logits"] / t).max()) for r in rows])
+    return conf, correctness(rows)
+
+
+def paired_ece_gap(rows_a: Sequence[Dict[str, Any]], rows_b: Sequence[Dict[str, Any]],
+                   t_a: float, t_b: float, n_boot: int = 4000, n_perm: int = 4000,
+                   alpha: float = 0.05, seed: int = 0,
+                   bins: int = DEFAULT_BINS) -> Dict[str, Any]:
+    """Is the ECE difference between two graphs distinguishable from zero on these rows?
+
+    **Paired, and at full sample size.** Both graphs answered the same questions, so their ECEs
+    are computed from the same rows and are strongly positively correlated: a row that lands in
+    an over-confident bin does so for both. The variance of the *difference* is therefore
+    `Var_a + Var_b - 2 Cov(a, b)`, and an estimator that ignores the covariance term -- for
+    instance by drawing two independent bootstrap samples, one per graph -- reports a spread
+    close to `sqrt(2)` times the standard error of a single ECE when the true spread is much
+    smaller. That overstates the noise, which makes a real difference look like sampling error.
+    It is the conservative direction, and it is still wrong: it is also exactly the mistake of
+    using a paired test (McNemar) for accuracy and an unpaired null for ECE in the same
+    analysis.
+
+    So both procedures below resample *row indices once* and score both graphs on the same
+    resampled rows, which respects the pairing the way McNemar's discordant-pair counting does.
+
+    Two complementary answers, because they ask slightly different questions:
+
+    - `gap_ci`: a percentile bootstrap interval for the signed difference `ECE_a - ECE_b`.
+      `ci_excludes_zero` is the direct answer to "is this gap real".
+    - `null_gap_p95` / `permutation_p`: a permutation null in which each row's two
+      `(confidence, correctness)` pairs are exchanged with probability 1/2, which is the
+      hypothesis that the two graphs are interchangeable row by row. `null_gap_p95` is the
+      smallest |gap| that would be surprising at this `n`, i.e. a "noise floor" that can be
+      quoted next to an observed gap.
+
+    The temperature travels with its graph through both procedures: swapping a row means
+    swapping the `(conf, correct)` pair that graph's own fitted temperature produced, not
+    re-scoring one graph's logits at the other's temperature.
+    """
+    _require_aligned(rows_a, rows_b)
+    if not len(rows_a):
+        raise ValueError("cannot compare ECE on zero rows")
+
+    ca, ra_ = conf_correct(rows_a, t_a)
+    cb, rb_ = conf_correct(rows_b, t_b)
+    ece_a = ece_score(ca, ra_, bins=bins)
+    ece_b = ece_score(cb, rb_, bins=bins)
+    observed = ece_a - ece_b
+
+    n = len(rows_a)
+    rng = np.random.default_rng(seed)
+
+    boot = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, n)          # one index draw, used for BOTH graphs
+        boot[i] = (ece_score(ca[idx], ra_[idx], bins=bins)
+                   - ece_score(cb[idx], rb_[idx], bins=bins))
+    lo, hi = float(np.quantile(boot, alpha / 2)), float(np.quantile(boot, 1 - alpha / 2))
+
+    null = np.empty(n_perm)
+    for i in range(n_perm):
+        swap = rng.random(n) < 0.5
+        pa_c, pa_r = np.where(swap, cb, ca), np.where(swap, rb_, ra_)
+        pb_c, pb_r = np.where(swap, ca, cb), np.where(swap, ra_, rb_)
+        null[i] = abs(ece_score(pa_c, pa_r, bins=bins) - ece_score(pb_c, pb_r, bins=bins))
+    # +1 in numerator and denominator: the observed assignment is itself one of the possible
+    # permutations, and omitting it can produce p = 0, which no finite permutation test can
+    # actually justify.
+    perm_p = float((1 + int((null >= abs(observed) - 1e-12).sum())) / (n_perm + 1))
+
+    return {
+        "n": n,
+        "ece_a": round(float(ece_a), 4),
+        "ece_b": round(float(ece_b), 4),
+        "gap": round(float(observed), 4),
+        "gap_ci": [round(lo, 4), round(hi, 4)],
+        "ci_excludes_zero": bool(lo > 0 or hi < 0),
+        "null_gap_p95": round(float(np.quantile(null, 0.95)), 4),
+        "permutation_p": round(perm_p, 4),
+    }
 
 
 def paired_mcnemar(rows_a: Sequence[Dict[str, Any]],
@@ -288,14 +393,9 @@ def paired_mcnemar(rows_a: Sequence[Dict[str, Any]],
     `math.comb` can compute outright, and a p-value is exactly the kind of number this task is
     not allowed to approximate for convenience.
     """
-    if len(rows_a) != len(rows_b):
-        raise ValueError("McNemar needs paired rows: got %d and %d" % (len(rows_a), len(rows_b)))
-    for ra, rb in zip(rows_a, rows_b):
-        # Pairing is by position, and a mismatched gold means the two lists are not the same
-        # questions in the same order -- which would make every number below meaningless.
-        if ra["gold"] != rb["gold"] or ra["bucket"] != rb["bucket"]:
-            raise ValueError("rows are not aligned: %r/%r vs %r/%r"
-                             % (ra["bucket"], ra["gold"], rb["bucket"], rb["gold"]))
+    # Pairing is by position; a mismatched gold or bucket means the two lists are not the same
+    # questions in the same order, which would make every number below meaningless.
+    _require_aligned(rows_a, rows_b)
 
     ca, cb = correctness(rows_a), correctness(rows_b)
     b = int(((ca == 1) & (cb == 0)).sum())
@@ -458,29 +558,64 @@ def main(argv=None) -> int:
     from laya_onnx.export.refit_temps import fit_temperatures
 
     ap = argparse.ArgumentParser(description="fp32 vs int8 calibration study")
-    ap.add_argument("fp32_dir")
-    ap.add_argument("int8_dir")
+    # Optional, because --rows-in makes the whole study reproducible with no checkpoint at all.
+    ap.add_argument("fp32_dir", nargs="?")
+    ap.add_argument("int8_dir", nargs="?")
     ap.add_argument("--n", type=int, default=200, help="examples per dataset")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None, help="write the full result as JSON")
+    # Collecting 1500 records through two 322M-parameter graphs takes tens of minutes and 1.3 GB
+    # of weights on disk. The rows are the only thing any statistic here needs, and they are
+    # deterministic, so caching them makes every number below re-derivable from this driver on a
+    # machine that has no checkpoint at all -- which is the difference between a published
+    # statistic that can be checked and one that has to be taken on trust.
+    ap.add_argument("--rows-out", default=None, help="cache the collected rows to this .npz")
+    ap.add_argument("--rows-in", default=None,
+                    help="load rows from a .npz written by --rows-out instead of running the "
+                         "graphs (needs no weights)")
+    ap.add_argument("--rows-keys", default="fp32,int8",
+                    help="the two array names to read from --rows-in")
     a = ap.parse_args(argv)
 
-    print("building datasets (n=%d per dataset) ..." % a.n, flush=True)
-    suites = _build_dataset(a.n)
-    dataset = [rec for name in sorted(suites) for rec in suites[name]]
-    print("  %d records across %d suites" % (len(dataset), len(suites)))
+    if not a.rows_in and not (a.fp32_dir and a.int8_dir):
+        ap.error("give both fp32_dir and int8_dir, or --rows-in to work from cached rows")
 
-    result: Dict[str, Any] = {"n_per_dataset": a.n, "seed": a.seed,
-                              "suites": {k: len(v) for k, v in suites.items()}}
+    result: Dict[str, Any] = {"n_per_dataset": a.n, "seed": a.seed}
 
-    print("\ncollecting fp32 logits ...", flush=True)
-    ag32 = load(a.fp32_dir)
-    rows32 = collect_logits(ag32, dataset, progress_every=100)
+    if a.rows_in:
+        ka, kb = a.rows_keys.split(",")
+        z = np.load(a.rows_in, allow_pickle=True)
+        rows32, rows8 = list(z[ka]), list(z[kb])
+        print("loaded %d + %d rows from %s (keys %s, %s)"
+              % (len(rows32), len(rows8), a.rows_in, ka, kb))
+        # The cache holds rows, not configs. These are the checkpoint defaults, and
+        # `laya-multilingual` ships no fitted temperatures at all, so nothing is lost.
+        temp32 = temp8 = [1.0, 1.0, 1.0]
+        before32: Dict[str, float] = {}
+        before8: Dict[str, float] = {}
+    else:
+        print("building datasets (n=%d per dataset) ..." % a.n, flush=True)
+        suites = _build_dataset(a.n)
+        dataset = [rec for name in sorted(suites) for rec in suites[name]]
+        print("  %d records across %d suites" % (len(dataset), len(suites)))
+        result["suites"] = {k: len(v) for k, v in suites.items()}
+
+        print("collecting fp32 logits ...", flush=True)
+        ag32 = load(a.fp32_dir)
+        rows32 = collect_logits(ag32, dataset, progress_every=100)
+
+        print("collecting int8 logits ...", flush=True)
+        ag8 = load(a.int8_dir)
+        rows8 = collect_logits(ag8, dataset, progress_every=100)
+
+        temp32, temp8 = ag32.temperature, ag8.temperature
+        before32, before8 = ag32.temperature_by_options, ag8.temperature_by_options
+        if a.rows_out:
+            np.savez_compressed(a.rows_out, fp32=np.array(rows32, dtype=object),
+                                int8=np.array(rows8, dtype=object))
+            print("cached rows to %s" % a.rows_out)
+
     fit32, rep32, unfit32 = split_rows(rows32, seed=a.seed)
-
-    print("collecting int8 logits ...", flush=True)
-    ag8 = load(a.int8_dir)
-    rows8 = collect_logits(ag8, dataset, progress_every=100)
     fit8, rep8, unfit8 = split_rows(rows8, seed=a.seed)
 
     # The split is derived from the row ordering, which is identical for both graphs (the same
@@ -488,20 +623,75 @@ def main(argv=None) -> int:
     assert [r["gold"] for r in rep32] == [r["gold"] for r in rep8]
 
     result["unfitted_buckets"] = sorted(set(unfit32) | set(unfit8))
-    result["fp32_before"] = metrics_from_rows(rep32, ag32.temperature, ag32.temperature_by_options)
-    result["int8_before"] = metrics_from_rows(rep8, ag8.temperature, ag8.temperature_by_options)
+    result["fp32_before"] = metrics_from_rows(rep32, temp32, before32)
+    result["int8_before"] = metrics_from_rows(rep8, temp8, before8)
 
     # Ruling: the fit is done against the graph that ships. Also fit fp32, purely so the
     # comparison after fitting is like-for-like rather than fp32-unfitted vs int8-fitted.
     result["temps_int8"], result["temps_int8_raw"] = fit_temperatures(fit8)
     result["temps_fp32"], result["temps_fp32_raw"] = fit_temperatures(fit32)
-    result["fp32_after"] = metrics_from_rows(rep32, ag32.temperature, result["temps_fp32"])
-    result["int8_after"] = metrics_from_rows(rep8, ag8.temperature, result["temps_int8"])
+    result["fp32_after"] = metrics_from_rows(rep32, temp32, result["temps_fp32"])
+    result["int8_after"] = metrics_from_rows(rep8, temp8, result["temps_int8"])
 
     _table("fp32, before fitting (held-out half)", result["fp32_before"])
     _table("int8, before fitting (held-out half)", result["int8_before"])
     _table("fp32, after fitting (held-out half)", result["fp32_after"])
     _table("int8, after fitting (held-out half)", result["int8_after"])
+    # ---------------------------------------------------------------- uncertainty
+    # Emitted by the driver, not by an off-tree script, so every published interval and p-value
+    # is re-derivable from `python -m laya_onnx.bench.eval_ece` (with --rows-in, without even a
+    # checkpoint). A number in a README whose only provenance is a script nobody has is exactly
+    # the kind of claim this repository does not make.
+    print("")
+    print("=== uncertainty on the held-out half ===")
+    buckets = sorted({r["bucket"] for r in rep32})
+    result["uncertainty"] = {}
+    print("  %-13s %4s | %-26s | %-26s" % ("bucket", "n", "accuracy fp32 [95% CI]",
+                                           "accuracy int8 [95% CI]"))
+    for b in buckets:
+        g32 = [r for r in rep32 if r["bucket"] == b]
+        g8 = [r for r in rep8 if r["bucket"] == b]
+        a32, a8 = accuracy_of(g32), accuracy_of(g8)
+        c32 = bootstrap_ci(g32, accuracy_of, seed=1)
+        c8 = bootstrap_ci(g8, accuracy_of, seed=1)
+        result["uncertainty"][b] = {
+            "n": len(g32),
+            "accuracy_fp32": round(a32, 4), "accuracy_fp32_ci": [round(x, 4) for x in c32],
+            "accuracy_int8": round(a8, 4), "accuracy_int8_ci": [round(x, 4) for x in c8],
+        }
+        print("  %-13s %4d | %.4f [%.4f, %.4f]     | %.4f [%.4f, %.4f]"
+              % (b, len(g32), a32, c32[0], c32[1], a8, c8[0], c8[1]))
+
+    print("")
+    print("  ECE gap, PAIRED (same resampled rows score both graphs; the covariance between")
+    print("  two ECEs measured on identical rows is large, and dropping it overstates noise):")
+    print("  %-13s %4s %9s %9s %8s %-20s %6s %8s %8s"
+          % ("bucket", "n", "ECE_fp32", "ECE_int8", "gap", "gap 95% CI", "sig?", "null_p95",
+             "perm_p"))
+    for b in buckets:
+        g32 = [r for r in rep32 if r["bucket"] == b]
+        g8 = [r for r in rep8 if r["bucket"] == b]
+        gap = paired_ece_gap(g32, g8, result["temps_fp32"][b], result["temps_int8"][b])
+        result["uncertainty"][b]["ece_gap"] = gap
+        print("  %-13s %4d %9.4f %9.4f %8.4f [%7.4f, %7.4f] %6s %8.4f %8.4f"
+              % (b, gap["n"], gap["ece_a"], gap["ece_b"], gap["gap"],
+                 gap["gap_ci"][0], gap["gap_ci"][1],
+                 "YES" if gap["ci_excludes_zero"] else "no",
+                 gap["null_gap_p95"], gap["permutation_p"]))
+
+    print("")
+    print("  paired McNemar on accuracy (b = fp32 right / int8 wrong):")
+    print("  %-13s %5s %6s %6s %7s %12s" % ("bucket", "n", "b", "c", "disc", "p"))
+    result["mcnemar"] = {}
+    for b in buckets + ["ALL"]:
+        g32 = rep32 if b == "ALL" else [r for r in rep32 if r["bucket"] == b]
+        g8 = rep8 if b == "ALL" else [r for r in rep8 if r["bucket"] == b]
+        m = paired_mcnemar(g32, g8)
+        result["mcnemar"][b] = m
+        print("  %-13s %5d %6d %6d %7d %12.3g"
+              % (b, m["n_pairs"], m["b_only_a_right"], m["c_only_b_right"],
+                 m["discordant"], m["p_value"]))
+
     # Rail status, not just "was it clamped". A bucket that fitted at 4.9490 against a 5.0
     # bound was never clamped and would print clean under a clamp-only check, but its optimum
     # sits at the edge of the publishable range and the number should not be read as converged.

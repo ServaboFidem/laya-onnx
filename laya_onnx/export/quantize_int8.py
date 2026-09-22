@@ -7,11 +7,14 @@ in ranges that a multilingual encoder -- whose activation statistics shift with 
 language -- has no single representative sample for. Dynamic quantization needs no calibration
 data at all and cannot be silently mis-calibrated by an unrepresentative one.
 
-What it *can* do is move the logits, which is why this module is only half the story. Int8
-weights perturb the pre-softmax logits by a small amount that argmax usually absorbs and
-calibration does not: the label stays the same while the published probability drifts. The
-measurement that decides whether that drift is acceptable lives in `laya_onnx/bench/eval_ece.py`,
-and the temperature refit that can repair it lives in `laya_onnx/export/refit_temps.py`. Running
+What it *can* do is move the logits, which is why this module is only half the story. The
+textbook worry is that argmax absorbs the perturbation while calibration does not -- the label
+stays the same while the published probability drifts -- and that is worth guarding against
+because no structural test would catch it. **On this checkpoint the opposite happened.** The
+labels moved and the calibration did not measurably: see point 4 below. Both directions are
+invisible without measurement, which is the actual reason this module is only half the story.
+The measurement lives in `laya_onnx/bench/eval_ece.py`, and the temperature refit that can
+repair a calibration drift lives in `laya_onnx/export/refit_temps.py`. Running
 this module without running those is exactly the failure mode laya exists to avoid -- a model
 that picks the right label and lies about how sure it is.
 
@@ -75,9 +78,12 @@ Four mechanical points about *this* graph, each of which costs a confusing failu
      - Max absolute logit deviation from fp32 stayed in the same 6-19 nat range.
 
    So the damage lives in the body's 100 quantized linear layers, not in the embedding lookup.
-   Calibration survives either way (after a temperature refit, ECE is within 0.02 of fp32 in
-   every bucket); the labels do not. `laya_onnx/README.md` carries the full three-way table and
-   the conclusion, which is to ship fp32.
+   What fails is the *labels*. ECE does not distinguish the three graphs at the sample size
+   measured -- seven of eight per-bucket gaps sit below their own paired noise floor and the
+   eighth does not survive correction for eight comparisons -- so calibration is not where int8
+   breaks, but "calibration survives" is a stronger claim than the data supports and this file
+   does not make it. `laya_onnx/README.md` carries the three-way table, the intervals and the
+   conclusion, which is to ship fp32.
 
    The default is nonetheless `quantize_embeddings=False`. Not because it recovers accuracy --
    it does not, and no comment here should be read as claiming otherwise -- but because a
