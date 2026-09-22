@@ -100,11 +100,12 @@ from onnxruntime.quantization import QuantType, quantize_dynamic
 
 _SUMMARY = "Dynamic int8 quantization of an fp32 laya-onnx export."
 
-# The one registry op this graph should be quantized through. See point 4 of the module
-# docstring: the default set also contains `Gather`, and this graph's only `Gather` over a large
-# initializer is the 256k-row token-embedding table, whose per-tensor quantization is what broke
-# the first export. `Transpose` is also in the default set but is a no-op unless its input is
-# already quantized, so naming MatMul alone loses nothing measurable here.
+# The one registry op this graph is quantized through by default. The default set also contains
+# `Gather`, and this graph's only `Gather` over a large initializer is the 256k-row
+# token-embedding table, which `Gather` quantization would collapse onto a single scale.
+# Excluding it was *measured* and did NOT recover the accuracy int8 costs here -- see point 4 of
+# the module docstring for the numbers. `Transpose` is also in the default set but is a no-op
+# unless its input is already quantized, so naming MatMul alone loses nothing measurable.
 _BODY_OP_TYPES = ["MatMul"]
 
 # The initializer that must stay fp32 when `quantize_embeddings` is False. Named explicitly so
@@ -194,8 +195,10 @@ def assert_embeddings_not_quantized(onnx_path: str) -> None:
         raise RuntimeError(
             "%r quantized the token-embedding table: found initializer %r with dtype %s and "
             "shape %s. That is a per-tensor quantization of ~196M parameters across 256k rows "
-            "sharing one scale, which on this checkpoint flips the predicted label on roughly "
-            "a quarter of inputs. The op-type restriction did not take effect."
+            "sharing one scale. Measured on this checkpoint, excluding it does NOT recover the "
+            "accuracy int8 costs -- the damage is elsewhere -- so this is not the error that "
+            "explains a bad int8 model; it means the op-type restriction did not take effect "
+            "and the graph is not the one that was asked for."
             % (onnx_path, bad.name, onnx.TensorProto.DataType.Name(bad.data_type),
                list(bad.dims)))
 
@@ -261,10 +264,11 @@ def quantize(fp32_path: str, int8_path: str, quantize_embeddings: bool = False) 
             os.remove(staged)
 
     # Prove it from the written graph rather than trusting the op-type restriction. An
-    # op_types_to_quantize that silently stopped covering this case would otherwise produce a
-    # model that loads, answers, and is wrong on a quarter of inputs -- which is exactly the
-    # failure this default exists to prevent, and exactly the kind that no structural test
-    # catches.
+    # op_types_to_quantize that silently stopped covering this case would produce a graph that
+    # is not the one the caller asked for, and would do it silently -- the model still loads
+    # and still answers. That mattered most while the exclusion was being used as an experiment:
+    # a flag that quietly did nothing would have produced two identical graphs and a confident
+    # null result.
     if not quantize_embeddings:
         assert_embeddings_not_quantized(dst_model)
 

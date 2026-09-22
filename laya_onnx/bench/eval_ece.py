@@ -39,24 +39,39 @@ import math
 import os
 import random
 import sys
+
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import numpy as np
+# transformers probes for TensorFlow at import and its abseil runtime can deadlock model
+# construction; laya is torch-only and every entry point in this repository sets these. This
+# module reaches torch transitively through `laya.common`, so it is one of them -- CI sets them
+# job-wide, but the manual local run that produces the published numbers is otherwise
+# unprotected, and that run is where the numbers come from.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_TORCH", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import numpy as np  # noqa: E402
 
 # laya.common drags in torch. That is allowed here and nowhere else under laya_onnx/ (see this
 # package's __init__): bench/ is measurement, not the serving path. Reusing the upstream
 # estimator rather than rebinning locally is what makes these ECE numbers comparable to the
 # ones already published for the torch path.
-from laya.common import ece_score
+from laya.common import ece_score            # noqa: E402
 
-from ..collate import collate
-from ..postprocess import QTYPES, clamp_temperature, confidence_from_probs, temp_bucket
+from ..collate import collate                # noqa: E402
+from ..postprocess import (                  # noqa: E402
+    QTYPES,
+    clamp_temperature,
+    confidence_from_probs,
+    temp_bucket,
+)
 # `_to_internal` is private to runtime.py, and importing it is the lesser evil: the alternative
 # is a second copy of laya's question-normalisation rules living in the benchmark, free to drift
 # away from the one the runtime actually uses -- at which point this module would be measuring a
 # slightly different model than the one that ships.
-from ..runtime import _to_internal
-from ..sequence import build_sequence, render_options
+from ..runtime import _to_internal           # noqa: E402
+from ..sequence import build_sequence, render_options   # noqa: E402
 
 DEFAULT_BINS = 15
 
@@ -208,6 +223,93 @@ def measure_ece(agent, dataset: Iterable[Dict[str, Any]],
         rows, agent.temperature,
         agent.temperature_by_options if temperature_by_options is None else temperature_by_options,
         bins=bins)
+
+
+# --------------------------------------------------------------------------- uncertainty
+# An ECE quoted to 4 decimal places on 150 rows across 15 bins invites a comparison the sample
+# size does not support. "int8 ECE is within 0.02 of fp32" is a claim about two noisy estimates,
+# and in a repository whose rule is that claims are measured or attributed, the noise has to be
+# measured too. Two estimators below: a bootstrap interval for any per-bucket statistic, and
+# McNemar for the paired accuracy comparison that the ship/don't-ship decision actually rests on.
+
+
+def correctness(rows: Sequence[Dict[str, Any]]) -> np.ndarray:
+    """0/1 correctness per row. Temperature-free on purpose: a temperature divides every logit
+    by the same scalar and cannot reorder them, so accuracy is invariant under it (asserted in
+    tests/test_onnx_calibration.py). Taking a temperature here would imply otherwise."""
+    return np.asarray([float(int(r["logits"].argmax()) == r["gold"]) for r in rows])
+
+
+def accuracy_of(rows: Sequence[Dict[str, Any]]) -> float:
+    return float(correctness(rows).mean()) if len(rows) else float("nan")
+
+
+def ece_of(rows: Sequence[Dict[str, Any]], t: float, bins: int = DEFAULT_BINS) -> float:
+    """Top-1-probability ECE for `rows` at a fixed temperature `t`."""
+    if not len(rows):
+        return float("nan")
+    conf = np.asarray([float(_softmax(r["logits"] / t).max()) for r in rows])
+    return ece_score(conf, correctness(rows), bins=bins)
+
+
+def bootstrap_ci(rows: Sequence[Dict[str, Any]], statistic, n_boot: int = 2000,
+                 alpha: float = 0.05, seed: int = 0) -> Tuple[float, float]:
+    """Percentile bootstrap interval for `statistic(rows)`, resampling rows with replacement.
+
+    The bootstrap rather than a closed form because ECE has no usable analytic standard error:
+    it is a sum over occupied bins of |mean confidence - mean accuracy| weighted by bin mass,
+    and both the bin occupancy and the within-bin means are random. Resampling the rows
+    reproduces exactly the sampling variation the reported number is subject to.
+
+    Deterministic from `seed` so a published interval can be reproduced.
+    """
+    if not len(rows):
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    n = len(rows)
+    vals = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, n)
+        vals[i] = statistic([rows[j] for j in idx])
+    return (float(np.quantile(vals, alpha / 2)), float(np.quantile(vals, 1 - alpha / 2)))
+
+
+def paired_mcnemar(rows_a: Sequence[Dict[str, Any]],
+                   rows_b: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Exact two-sided McNemar test on the paired correctness of two graphs over the same rows.
+
+    McNemar rather than a two-sample proportion test because the rows are *paired*: both graphs
+    answered the same questions, so the two accuracies are strongly dependent and an unpaired
+    test would badly overstate the variance. Only the discordant pairs carry information --
+    `b` = a right / b wrong, `c` = a wrong / b right -- and under the null they split 50/50.
+
+    The exact binomial p-value rather than the chi-square approximation: `b + c` here is small
+    enough (tens) that the continuity-corrected chi-square is an approximation to something
+    `math.comb` can compute outright, and a p-value is exactly the kind of number this task is
+    not allowed to approximate for convenience.
+    """
+    if len(rows_a) != len(rows_b):
+        raise ValueError("McNemar needs paired rows: got %d and %d" % (len(rows_a), len(rows_b)))
+    for ra, rb in zip(rows_a, rows_b):
+        # Pairing is by position, and a mismatched gold means the two lists are not the same
+        # questions in the same order -- which would make every number below meaningless.
+        if ra["gold"] != rb["gold"] or ra["bucket"] != rb["bucket"]:
+            raise ValueError("rows are not aligned: %r/%r vs %r/%r"
+                             % (ra["bucket"], ra["gold"], rb["bucket"], rb["gold"]))
+
+    ca, cb = correctness(rows_a), correctness(rows_b)
+    b = int(((ca == 1) & (cb == 0)).sum())
+    c = int(((ca == 0) & (cb == 1)).sum())
+    n = b + c
+    if n == 0:
+        p = 1.0
+    else:
+        k = min(b, c)
+        tail = sum(math.comb(n, i) for i in range(k + 1))
+        p = min(1.0, 2.0 * tail / (2.0 ** n))
+    return {"n_pairs": len(rows_a), "b_only_a_right": b, "c_only_b_right": c,
+            "discordant": n, "p_value": p,
+            "accuracy_a": round(float(ca.mean()), 4), "accuracy_b": round(float(cb.mean()), 4)}
 
 
 # --------------------------------------------------------------------------- fit/report split
@@ -400,17 +502,29 @@ def main(argv=None) -> int:
     _table("int8, before fitting (held-out half)", result["int8_before"])
     _table("fp32, after fitting (held-out half)", result["fp32_after"])
     _table("int8, after fitting (held-out half)", result["int8_after"])
-    print("\nfitted temperatures (raw -> clamped):")
-    for b in sorted(result["temps_int8"]):
-        print("  int8 %-14s %8.4f -> %.4f%s"
-              % (b, result["temps_int8_raw"][b], result["temps_int8"][b],
-                 "   CLAMPED" if abs(result["temps_int8_raw"][b] - result["temps_int8"][b]) > 1e-9
-                 else ""))
-    for b in sorted(result["temps_fp32"]):
-        print("  fp32 %-14s %8.4f -> %.4f%s"
-              % (b, result["temps_fp32_raw"][b], result["temps_fp32"][b],
-                 "   CLAMPED" if abs(result["temps_fp32_raw"][b] - result["temps_fp32"][b]) > 1e-9
-                 else ""))
+    # Rail status, not just "was it clamped". A bucket that fitted at 4.9490 against a 5.0
+    # bound was never clamped and would print clean under a clamp-only check, but its optimum
+    # sits at the edge of the publishable range and the number should not be read as converged.
+    from laya_onnx.export.refit_temps import REACHABLE_BUCKETS, rail_status
+    print("")
+    print("fitted temperatures (raw -> clamped, with rail status):")
+    result["rail"] = {}
+    for tag in ("fp32", "int8"):
+        raw_map, clamped_map = result["temps_%s_raw" % tag], result["temps_%s" % tag]
+        result["rail"][tag] = {b: rail_status(raw_map[b]) for b in raw_map}
+        for b in sorted(clamped_map):
+            status = result["rail"][tag][b]
+            print("  %-4s %-14s %8.4f -> %.4f%s"
+                  % (tag, b, raw_map[b], clamped_map[b],
+                     "" if status == "ok" else "   " + status.upper()))
+    railed = sorted("%s/%s" % (tag, b) for tag in result["rail"]
+                    for b, st in result["rail"][tag].items() if st != "ok")
+    if railed:
+        print("  at or near a clamp bound (NOT converged optima): %s" % ", ".join(railed))
+    never = [b for b in REACHABLE_BUCKETS if b not in result["temps_fp32"]]
+    if never:
+        print("  never measured by this study, so they publish a raw unfitted softmax: %s"
+              % ", ".join(never))
     if result["unfitted_buckets"]:
         print("\nunfitted (too few held-out rows): %s" % ", ".join(result["unfitted_buckets"]))
 

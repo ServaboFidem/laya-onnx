@@ -32,15 +32,16 @@ whose calibration was *not* achieved, and it should be described that way rather
 included in an average.
 """
 import argparse
+import datetime
 import json
 import math
 import os
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ..bench.eval_ece import collect_logits, split_rows
-from ..postprocess import clamp_temperature
+from ..postprocess import TEMP_MAX, TEMP_MIN, clamp_temperature
 
 # The search range for the *raw* fit, deliberately far wider than the [0.5, 5.0] the result is
 # clamped to. Fitting inside the clamp would make "hit the rail" unobservable: every bucket
@@ -49,6 +50,27 @@ from ..postprocess import clamp_temperature
 # is the difference between a calibrated bucket and one that merely looks calibrated.
 RAW_T_MIN = 0.05
 RAW_T_MAX = 20.0
+
+# How close to a clamp bound counts as "at the rail". A fit that lands within 2% of [0.5, 5.0]
+# is reporting that the minimum it wanted lies outside the range it was allowed -- or so close
+# to the edge that a slightly different sample would have clamped it. Either way the number is
+# a boundary artifact, not a converged optimum, and a caller that cannot tell the difference
+# will average it in with the honest ones. Measured instance: this checkpoint's int8-body
+# `noul:2` bucket fits at 4.9490, 99% of the way to the upper bound without triggering the
+# clamp at all.
+RAIL_TOLERANCE = 0.02
+
+# Every bucket string `postprocess.temp_bucket` can actually produce, so `write_temperatures`
+# can say which ones a fitted mapping does *not* cover. Nine, not twelve: `choice` and `score`
+# each reach all four size classes, but `sequence.render_options` builds a `noul` question's
+# options as a fixed `[false, true]` pair (laya_onnx/sequence.py:41-44), so k is always 2 there
+# and `noul:3-5` / `noul:6-10` / `noul:11+` are unreachable by construction.
+_SIZE_CLASSES = ["2", "3-5", "6-10", "11+"]
+REACHABLE_BUCKETS = tuple(
+    ["choice:%s" % z for z in _SIZE_CLASSES]
+    + ["score:%s" % z for z in _SIZE_CLASSES]
+    + ["noul:2"]
+)
 
 _PHI = (math.sqrt(5.0) - 1.0) / 2.0
 
@@ -108,6 +130,53 @@ def fit_temperatures(rows: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, float], 
     return clamped, raw
 
 
+def rail_status(raw: float, lo: float = TEMP_MIN, hi: float = TEMP_MAX,
+                tolerance: float = RAIL_TOLERANCE) -> str:
+    """`"ok"`, `"clamped"`, or `"near_rail"` for one raw fitted temperature.
+
+    `near_rail` exists because `clamped` alone under-reports the problem. A fit that wanted
+    4.9490 against an upper bound of 5.0 was never clamped, so a clamp-only check calls it
+    healthy -- but it is the same boundary artifact as one that wanted 6.0, arrived at by a
+    sample that happened to fall just inside. Both mean the optimum is at or past the edge of
+    the range the caller is willing to publish.
+    """
+    if raw < lo or raw > hi:
+        return "clamped"
+    span = hi - lo
+    if raw - lo <= tolerance * span or hi - raw <= tolerance * span:
+        return "near_rail"
+    return "ok"
+
+
+def refit_report(agent, dataset, seed: int = 0,
+                 min_per_bucket: int = 20) -> Dict[str, Any]:
+    """`refit` with its working shown: the mapping plus everything `refit` has to throw away.
+
+    Returns `{"temperature_by_options", "raw", "rail", "unfitted_buckets", "n_fit", "n_report",
+    "buckets_seen"}`.
+
+    `refit` returns a bare `dict[str, float]` because that is the interface the plan specifies
+    and the shape `write_temperatures` consumes. But a bare mapping cannot say that `noul:2`
+    fitted at 4.9490 against a 5.0 bound, or that `score:3-5` was dropped for having too few
+    rows -- and a caller who cannot see either will write a mapping into a checkpoint believing
+    every entry converged. So the diagnostics are not deleted, they are moved here, and `refit`
+    is a thin wrapper over this.
+    """
+    rows = collect_logits(agent, dataset)
+    fit_rows, report_rows, unfittable = split_rows(rows, seed=seed,
+                                                   min_per_bucket=min_per_bucket)
+    clamped, raw = fit_temperatures(fit_rows)
+    return {
+        "temperature_by_options": clamped,
+        "raw": raw,
+        "rail": {b: rail_status(raw[b]) for b in raw},
+        "unfitted_buckets": unfittable,
+        "n_fit": len(fit_rows),
+        "n_report": len(report_rows),
+        "buckets_seen": sorted({r["bucket"] for r in rows}),
+    }
+
+
 def refit(agent, dataset, seed: int = 0, min_per_bucket: int = 20) -> Dict[str, float]:
     """Fit `temperature_by_options` for `agent` on half of `dataset`.
 
@@ -120,27 +189,54 @@ def refit(agent, dataset, seed: int = 0, min_per_bucket: int = 20) -> Dict[str, 
     rather than fitted on what little they have; the runtime falls back to the per-qtype
     default for any bucket it does not find, so an omitted bucket is an *unfitted* bucket, which
     is the honest state to leave it in.
+
+    This return type is lossy by design -- it is the mapping and nothing else. Use
+    `refit_report` for the raw fits, the rail status of each, and which buckets were dropped.
     """
-    rows = collect_logits(agent, dataset)
-    fit_rows, _report_rows, _unfittable = split_rows(rows, seed=seed,
-                                                     min_per_bucket=min_per_bucket)
-    clamped, _raw = fit_temperatures(fit_rows)
-    return clamped
+    return refit_report(agent, dataset, seed=seed,
+                        min_per_bucket=min_per_bucket)["temperature_by_options"]
 
 
-def write_temperatures(model_dir: str, temperature_by_options: Dict[str, float]) -> str:
+def write_temperatures(model_dir: str, temperature_by_options: Dict[str, float],
+                       provenance: Optional[Dict[str, Any]] = None) -> str:
     """Merge `temperature_by_options` into `model_dir`'s rl_agent_config.json. Returns the path.
 
-    A merge, not a replacement: a later study that only re-fits the noul buckets must not silently
-    delete the choice ones. The keys are the `temp_bucket` strings, which is exactly what
-    `postprocess.build_answers` looks up.
+    A merge, not a replacement: a later study that only re-fits the noul buckets must not
+    silently delete the choice ones. The keys are the `temp_bucket` strings, which is exactly
+    what `postprocess.build_answers` looks up.
+
+    **A partial mapping is written alongside a record of what it does not cover.** A config
+    carrying four fitted temperatures looks calibrated. It is not: `build_answers` falls back to
+    the per-qtype default for any bucket it cannot find, so the five unwritten buckets publish a
+    raw, unfitted softmax -- and nothing in a bare `{"choice:3-5": 1.46, ...}` tells the next
+    reader which is which, on what data, or against which graph. So this function also writes
+    `temperature_by_options_provenance`, merging in whatever the caller passes (the graph, the
+    datasets, the split) and adding the facts it can derive itself: which reachable buckets are
+    covered and which are not.
+
+    The provenance key is additional, not structural -- `OnnxAgent` reads only
+    `temperature_by_options`, so an older runtime ignores it and nothing breaks.
     """
     path = os.path.join(model_dir, "rl_agent_config.json")
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
+
     existing = dict(cfg.get("temperature_by_options") or {})
     existing.update({k: float(v) for k, v in temperature_by_options.items()})
     cfg["temperature_by_options"] = existing
+
+    record = dict(cfg.get("temperature_by_options_provenance") or {})
+    record.update(provenance or {})
+    record["written_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds")
+    record["fitted_buckets"] = sorted(existing)
+    # The important half: what a reader would otherwise have to work out for themselves.
+    record["unfitted_buckets"] = [b for b in REACHABLE_BUCKETS if b not in existing]
+    record["unfitted_behaviour"] = (
+        "temp_bucket strings absent from temperature_by_options fall back to the per-qtype "
+        "default in `temperature` (1.0 for this checkpoint), i.e. an unfitted raw softmax.")
+    cfg["temperature_by_options_provenance"] = record
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     return path
@@ -156,13 +252,30 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="write fitted temperatures into an export config")
     ap.add_argument("model_dir")
     ap.add_argument("temperatures", help="JSON object, or a path to one, mapping bucket -> float")
+    ap.add_argument("--provenance", default=None,
+                    help="JSON object (or path to one) recording where these came from: the "
+                         "graph, the datasets, the split. Written alongside the mapping so a "
+                         "partial calibration cannot later be mistaken for a complete one.")
     a = ap.parse_args(argv)
-    raw = a.temperatures
-    if os.path.exists(raw):
-        with open(raw, encoding="utf-8") as f:
-            raw = f.read()
-    mapping = json.loads(raw)
-    print("wrote %s" % write_temperatures(a.model_dir, mapping))
+
+    def _load(v):
+        if v is None:
+            return None
+        if os.path.exists(v):
+            with open(v, encoding="utf-8") as f:
+                v = f.read()
+        return json.loads(v)
+
+    mapping = _load(a.temperatures)
+    path = write_temperatures(a.model_dir, mapping, provenance=_load(a.provenance))
+    with open(path, encoding="utf-8") as f:
+        record = json.load(f)["temperature_by_options_provenance"]
+    print("wrote %s" % path)
+    print("  fitted:   %s" % ", ".join(record["fitted_buckets"]))
+    print("  UNFITTED: %s  (these publish a raw, unfitted softmax)"
+          % (", ".join(record["unfitted_buckets"]) or "none"))
+    if a.provenance is None:
+        print("  no --provenance given; the config records only the bucket coverage.")
     return 0
 
 

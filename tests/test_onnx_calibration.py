@@ -24,13 +24,28 @@ import os
 import sys
 import tempfile
 
-import numpy as np
+# transformers probes for TensorFlow at import; with TF present its abseil runtime can deadlock
+# model construction. This suite reaches torch and transformers transitively through
+# laya.common (imported by laya_onnx.bench.eval_ece), so it needs the same guard every other
+# torch-touching entry point in this repo sets. CI sets them job-wide; a local `python
+# tests/test_onnx_calibration.py` does not.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_TORCH", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from laya_onnx.bench.eval_ece import (                                       # noqa: E402
+    accuracy_of,
+    bootstrap_ci,
     bucket_metrics,
+    collect_logits,
+    ece_of,
+    measure_ece,
     metrics_from_rows,
+    paired_mcnemar,
     split_rows,
     temperature_for,
 )
@@ -45,8 +60,12 @@ from laya_onnx.export.quantize_int8 import (                                 # n
 )
 from laya_onnx.export.refit_temps import (                                   # noqa: E402
     RAW_T_MIN,
+    REACHABLE_BUCKETS,
     fit_temperature,
     fit_temperatures,
+    rail_status,
+    refit,
+    refit_report,
     write_temperatures,
 )
 from laya_onnx.postprocess import QTYPES                                     # noqa: E402
@@ -329,6 +348,250 @@ with tempfile.TemporaryDirectory() as d:
     except RuntimeError as e:
         check_true("exclusion/unknown-graph-raises", _EMBEDDING_INITIALIZER in str(e),
                    "message was %r" % str(e))
+
+
+# ------------------------------------------------- the brief's own interfaces, on a fake agent
+# Everything above builds its rows by hand, which tests the arithmetic but leaves the three
+# functions the plan actually specifies -- `collect_logits`, `measure_ece`, `refit` -- with no
+# coverage at all, and never checks that `collect_logits` emits the shape the rest of the module
+# assumes. Worse, the two guards that protect the *validity* of every published number (option
+# truncation, gold range) were unexercised: a silently truncated option list drops the gold
+# label for some examples and turns an accuracy into a measurement of the truncation.
+#
+# A fake tokenizer and a fake session are enough, and the repo has precedent for exactly this
+# (tests/test_shortlist.py fakes `embed_fn` and mocks `predict`). No weights, no Hub, no ORT.
+
+
+class FakeTok:
+    """Whitespace tokenizer with the five attributes `build_sequence` reads.
+
+    Token ids come from a character sum rather than `hash()`, which is salted per process and
+    would make this test's sequence lengths differ between runs.
+    """
+    mask_token = "[MASK]"
+    mask_token_id = 4
+    cls_token_id = 1
+    sep_token_id = 2
+    pad_token_id = 0
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [10 + (sum(map(ord, w)) % 50) for w in text.split()]}
+
+
+class FakeSession:
+    """Returns the next row of `table` per batch row, padded to the batch's marker width."""
+
+    def __init__(self, table):
+        self.table = list(table)
+        self.calls = 0
+        self.batches = 0
+
+    def run(self, batch):
+        n, kmax = batch["marker_pos"].shape
+        self.batches += 1
+        logits = np.full((n, kmax), -1e4, dtype=np.float32)
+        act = np.zeros((n, 2), dtype=np.float32)
+        for i in range(n):
+            vals = self.table[self.calls]
+            self.calls += 1
+            logits[i, :len(vals)] = vals
+        return logits, act
+
+
+class FakeAgent:
+    def __init__(self, table, max_len=256, head_max_len=128):
+        self.tok = FakeTok()
+        self.session = FakeSession(table)
+        self.max_len = max_len
+        self.head_max_len = head_max_len
+        self.temperature = [1.0, 1.0, 1.0]
+        self.temperature_by_options = {}
+
+
+def choice_q(keys):
+    return {"type": "choice", "instructions": "which one", "criteria": {k: None for k in keys}}
+
+
+def noul_q():
+    return {"type": "noul", "instructions": "is it so"}
+
+
+# --- collect_logits emits the documented row shape ---------------------------------------
+ag = FakeAgent([[3.0, 1.0, 0.0], [0.5, 2.5]])
+ds = [{"state": {"s": "alpha beta"}, "questions": {"q": choice_q(["a", "b", "c"])},
+       "gold": {"q": 0}},
+      {"state": "gamma delta", "questions": {"q": noul_q()}, "gold": {"q": 1}}]
+got = collect_logits(ag, ds)
+check("collect/one-row-per-question", len(got), 2)
+check("collect/bucket", [r["bucket"] for r in got], ["choice:3-5", "noul:2"])
+check("collect/k", [r["k"] for r in got], [3, 2])
+check("collect/qtype", [r["qtype"] for r in got], [QTYPES["choice"], QTYPES["noul"]])
+check("collect/gold", [r["gold"] for r in got], [0, 1])
+# float64 matters: the NLL fit runs on these and float32 accumulation noise is the same order
+# as the int8-vs-fp32 differences the study is measuring.
+check("collect/logits-are-float64", [r["logits"].dtype for r in got],
+      [np.dtype("float64")] * 2)
+# Sliced to k, so the -1e4 padding the graph emits for unused marker slots never reaches a
+# softmax or an NLL.
+check("collect/logits-sliced-to-k", [list(r["logits"]) for r in got],
+      [[3.0, 1.0, 0.0], [0.5, 2.5]])
+check("collect/one-batch-per-record", ag.session.batches, 2)
+
+# --- the guards that protect every published number ---------------------------------------
+# A question whose markers do not all survive `max_len` has a truncated option list. Measuring
+# it would drop the gold label for some examples and not others.
+narrow = FakeAgent([[0.0] * 6], max_len=14, head_max_len=200)
+try:
+    collect_logits(narrow, [{"state": "x", "questions": {"q": choice_q(list("abcdef"))},
+                             "gold": {"q": 0}}])
+    FAIL.append("collect/truncated-options-raise: no raise")
+except ValueError as e:
+    check_true("collect/truncated-options-raise", "head_max_len" in str(e),
+               "message was %r" % str(e))
+
+# The exported graph was traced through laya/common.py's topk(2) branch.
+try:
+    collect_logits(FakeAgent([[0.0]]), [{"state": "x", "questions": {"q": choice_q(["only"])},
+                                         "gold": {"q": 0}}])
+    FAIL.append("collect/single-option-raises: no raise")
+except ValueError as e:
+    check_true("collect/single-option-raises", "at least 2" in str(e), "message was %r" % str(e))
+
+# A gold index outside the option set would score as permanently wrong and depress accuracy
+# silently.
+try:
+    collect_logits(FakeAgent([[1.0, 2.0, 3.0]]),
+                   [{"state": "x", "questions": {"q": choice_q(["a", "b", "c"])},
+                     "gold": {"q": 7}}])
+    FAIL.append("collect/gold-out-of-range-raises: no raise")
+except ValueError as e:
+    check_true("collect/gold-out-of-range-raises", "outside" in str(e), "message was %r" % str(e))
+
+# --- measure_ece end to end ----------------------------------------------------------------
+# Two noul rows at p = [0.2, 0.8] (logits differ by log 4), one right and one wrong: accuracy
+# 0.5, confidence 0.8, one bin, so ECE is exactly 0.3 -- the same hand-computable case the
+# synthetic rows use above, now driven through the real pipeline.
+pair = [0.0, math.log(4.0)]
+ece_ds = [{"state": "x", "questions": {"q": noul_q()}, "gold": {"q": 1}},
+          {"state": "y", "questions": {"q": noul_q()}, "gold": {"q": 0}}]
+res = measure_ece(FakeAgent([pair, pair]), ece_ds)
+check("measure_ece/buckets", sorted(res), ["noul:2"])
+check("measure_ece/n", res["noul:2"]["n"], 2)
+check("measure_ece/accuracy", res["noul:2"]["accuracy"], 0.5)
+check("measure_ece/ece", res["noul:2"]["ece"], 0.3)
+check("measure_ece/keys", sorted(res["noul:2"]),
+      ["accuracy", "ece", "ece_published_confidence", "k", "mean_confidence",
+       "mean_published_confidence", "n", "nll", "temperature"])
+# An override must reach the metric, or "after fitting" numbers would silently be "before".
+hot_res = measure_ece(FakeAgent([pair, pair]), ece_ds, temperature_by_options={"noul:2": 4.0})
+check("measure_ece/override-applies", hot_res["noul:2"]["temperature"], 4.0)
+check_true("measure_ece/override-softens",
+           hot_res["noul:2"]["mean_confidence"] < res["noul:2"]["mean_confidence"])
+
+# --- refit / refit_report -------------------------------------------------------------------
+# 40 noul records, enough to clear min_per_bucket on both halves.
+refit_ds = [{"state": "s%d" % i, "questions": {"q": noul_q()}, "gold": {"q": i % 2}}
+            for i in range(40)]
+mapping = refit(FakeAgent([pair] * 40), refit_ds)
+check("refit/returns-bucket-mapping", sorted(mapping), ["noul:2"])
+check_true("refit/temperature-is-clamped",
+           0.5 <= mapping["noul:2"] <= 5.0, "got %r" % mapping["noul:2"])
+rep = refit_report(FakeAgent([pair] * 40), refit_ds)
+check("refit/report-agrees-with-refit", rep["temperature_by_options"], mapping)
+check("refit/report-exposes-raw", sorted(rep["raw"]), ["noul:2"])
+check("refit/report-exposes-rail", sorted(rep["rail"]), ["noul:2"])
+check("refit/halves-are-equal", (rep["n_fit"], rep["n_report"]), (20, 20))
+# A bucket too small to hold data out must be reported, not quietly fitted on everything.
+small = refit_report(FakeAgent([pair] * 6),
+                     [{"state": "s", "questions": {"q": noul_q()}, "gold": {"q": 0}}] * 6)
+check("refit/too-small-bucket-unfitted", small["unfitted_buckets"], ["noul:2"])
+check("refit/too-small-bucket-absent-from-mapping", small["temperature_by_options"], {})
+check("refit/too-small-bucket-still-seen", small["buckets_seen"], ["noul:2"])
+
+# --- rail status ------------------------------------------------------------------------
+# The measured case: int8-body's noul:2 fitted at 4.9490 against a 5.0 bound. It was never
+# clamped, so a clamp-only check calls it healthy; it is not a converged optimum.
+check("rail/measured-4.949-is-near-rail", rail_status(4.9490), "near_rail")
+check("rail/comfortably-inside", rail_status(2.0), "ok")
+check("rail/just-above-upper-bound", rail_status(6.0), "clamped")
+check("rail/the-shipped-0.1006", rail_status(0.1006), "clamped")
+check("rail/just-inside-lower-bound", rail_status(0.55), "near_rail")
+
+# --- reachable buckets / provenance -------------------------------------------------------
+# Nine, not twelve: render_options builds a noul question's options as a fixed [false, true]
+# pair, so noul can only ever be k=2.
+check("buckets/reachable-count", len(REACHABLE_BUCKETS), 9)
+check("buckets/noul-only-has-k2", [b for b in REACHABLE_BUCKETS if b.startswith("noul")],
+      ["noul:2"])
+
+with tempfile.TemporaryDirectory() as d:
+    cfg = os.path.join(d, "rl_agent_config.json")
+    with open(cfg, "w", encoding="utf-8") as f:
+        json.dump({"max_len": 1024, "head_max_len": 256, "temperature_by_options": {}}, f)
+    write_temperatures(d, {"choice:3-5": 1.4634, "noul:2": 3.5028},
+                       provenance={"graph": "fp32", "datasets": ["ag_news"]})
+    with open(cfg, encoding="utf-8") as f:
+        after = json.load(f)
+    prov = after["temperature_by_options_provenance"]
+    check("provenance/caller-fields-kept", prov["graph"], "fp32")
+    check("provenance/fitted", prov["fitted_buckets"], ["choice:3-5", "noul:2"])
+    # The half that matters: a config with two entries looks calibrated until it says which
+    # seven buckets publish a raw softmax.
+    check("provenance/unfitted-is-the-complement", prov["unfitted_buckets"],
+          [b for b in REACHABLE_BUCKETS if b not in ("choice:3-5", "noul:2")])
+    check_true("provenance/explains-the-fallback", "raw" in prov["unfitted_behaviour"])
+    check_true("provenance/timestamped", prov["written_utc"].startswith("20"))
+    # The runtime contract: OnnxAgent reads only temperature_by_options, so the extra key is
+    # additive and an older runtime ignores it.
+    check("provenance/mapping-unaffected", after["temperature_by_options"],
+          {"choice:3-5": 1.4634, "noul:2": 3.5028})
+
+# --- McNemar --------------------------------------------------------------------------
+# Paired, because both graphs answered the same questions; an unpaired proportion test would
+# overstate the variance badly.
+# Same question (same gold) answered by two graphs, so the pair differs in its *logits*, not
+# in its label -- which is exactly the situation the test is for.
+right = row(QTYPES["noul"], 2, [0.0, 1.0], 1, "noul:2")     # predicts 1, gold 1 -> correct
+wrong = row(QTYPES["noul"], 2, [1.0, 0.0], 1, "noul:2")     # predicts 0, gold 1 -> incorrect
+m10 = paired_mcnemar([right] * 10, [wrong] * 10)
+check("mcnemar/discordant-count", (m10["b_only_a_right"], m10["c_only_b_right"]), (10, 0))
+# Exact two-sided binomial: 2 * C(10,0) / 2^10.
+check("mcnemar/exact-p", round(m10["p_value"], 10), round(2.0 / 1024, 10))
+check("mcnemar/no-discordance-is-p1", paired_mcnemar([right] * 5, [right] * 5)["p_value"], 1.0)
+check("mcnemar/reports-both-accuracies",
+      (m10["accuracy_a"], m10["accuracy_b"]), (1.0, 0.0))
+try:
+    paired_mcnemar([right] * 3, [right] * 4)
+    FAIL.append("mcnemar/length-mismatch-raises: no raise")
+except ValueError:
+    PASS.append("mcnemar/length-mismatch-raises")
+# Misaligned rows would silently compare different questions to each other.
+# A differing gold or bucket at the same position means the two lists are not the same
+# questions in the same order, which would silently compare unrelated answers.
+for label, other in (("bucket", row(QTYPES["noul"], 2, [0.0, 1.0], 1, "choice:2")),
+                     ("gold", row(QTYPES["noul"], 2, [0.0, 1.0], 0, "noul:2"))):
+    try:
+        paired_mcnemar([right], [other])
+        FAIL.append("mcnemar/misaligned-%s-raises: no raise" % label)
+    except ValueError as e:
+        check_true("mcnemar/misaligned-%s-raises" % label, "not aligned" in str(e),
+                   "message was %r" % str(e))
+
+# --- bootstrap ---------------------------------------------------------------------------
+mixed_rows = [right] * 8 + [wrong] * 2
+lo, hi = bootstrap_ci(mixed_rows, accuracy_of, n_boot=500, seed=3)
+check_true("bootstrap/brackets-the-estimate", lo <= accuracy_of(mixed_rows) <= hi,
+           "%.3f not in [%.3f, %.3f]" % (accuracy_of(mixed_rows), lo, hi))
+check("bootstrap/deterministic", bootstrap_ci(mixed_rows, accuracy_of, n_boot=500, seed=3),
+      (lo, hi))
+check_true("bootstrap/seed-changes-it",
+           bootstrap_ci(mixed_rows, accuracy_of, n_boot=500, seed=4) != (lo, hi))
+# A degenerate sample has no sampling variation, so the interval must collapse.
+check("bootstrap/no-variance-no-width",
+      bootstrap_ci([right] * 10, accuracy_of, n_boot=200, seed=5), (1.0, 1.0))
+check("bootstrap/accuracy-is-temperature-free", accuracy_of(mixed_rows), 0.8)
+check("bootstrap/ece-matches-bucket-metrics", round(ece_of(noul_rows, 1.0), 4),
+      bucket_metrics(noul_rows, [1.0, 1.0, 1.0], {})["ece"])
 
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
