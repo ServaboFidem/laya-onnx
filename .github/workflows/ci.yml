@@ -53,6 +53,26 @@ jobs:
       - name: Email cleaning tests
         run: python tests/test_email.py
 
+      # The eight offline ONNX suites. tests/test_onnx_local_e2e.py is NOT here on purpose: it
+      # needs the real multilingual weights plus a ~1.3 GB export on disk, exactly like
+      # tests/test_local_e2e.py, and is run by hand when the forward path changes.
+      #
+      # onnxscript is absent by design. It is only needed by the dynamo exporter inside
+      # laya_onnx/export/export_fp32.py, which no offline test runs (it needs weights); the
+      # suites below cover the export *guards* by inspection, not by exporting. torch and
+      # transformers arrive with `pip install -e .` above.
+      - name: ONNX runtime tests
+        run: |
+          pip install onnx onnxruntime tokenizers
+          python tests/test_onnx_sequence.py
+          python tests/test_onnx_truncation.py
+          python tests/test_onnx_tokenizer.py
+          python tests/test_onnx_postprocess.py
+          python tests/test_onnx_export.py
+          python tests/test_onnx_runtime.py
+          python tests/test_onnx_calibration.py
+          python tests/test_onnx_no_torch.py
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -63,9 +83,9 @@ jobs:
           python-version: "3.11"
       - run: pip install ruff
       - name: Ruff
-        run: ruff check laya/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
+        run: ruff check laya/ laya_onnx/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
       - name: Byte-compile every module
-        run: python -m compileall -q laya/ tests/
+        run: python -m compileall -q laya/ laya_onnx/ tests/
 
   build:
     name: package

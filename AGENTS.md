@@ -28,6 +28,16 @@ laya/            the package (7 modules, ~1.9k lines total)
   presets.py     ready-made question schemas (triage, email, guard, moderation, router)
   email.py       email body cleaning + email_state() helper
   shortlist.py   opt-in embedding shortlist for high-cardinality choice questions
+laya_onnx/      torch-free ONNX runtime for the multilingual checkpoint (see laya_onnx)
+  runtime.py     OnnxAgent: the no-torch mirror of laya.Agent; predict = system_one
+  session.py     onnxruntime wrapper; numpy + onnxruntime only, never torch
+  sequence.py    build_sequence, VENDORED from laya/common.py -- parity-tested, do not edit freely
+  collate.py     the five arrays the graph declares; padding and marker positions
+  postprocess.py logits -> typed answers; temperature lookup and clamping
+  tokenizer.py   TokenizerAdapter over `tokenizers`, replacing transformers' AutoTokenizer
+  truncation.py  truncation_report(): how much state was dropped, which torch never reports
+  export/        the ONE subpackage that may import torch; fp32 export, int8, temperature refit
+  bench/         latency + ECE measurement; may import torch, never fetches data, never shipped
 tests/           plain scripts, not pytest (see Testing)
 docs/            architecture + router-flow diagrams, self-contained HTML (see Diagrams)
 research/        benchmark harnesses + raw result JSON; never imported by the package
@@ -86,6 +96,73 @@ change both.
   the lock so concurrent predictions share a checkpoint (fix for #95). Don't widen the lock.
 - Hub downloads use `allow_patterns` so a bundled repo doesn't pull sibling checkpoints.
 
+## laya_onnx
+
+A torch-free ONNX runtime for the `multilingual` checkpoint (mmBERT-base, 1024/256 budget).
+`laya_onnx.load(dir)` returns an `OnnxAgent` whose `predict` / `system_one` return the same
+answer dicts as `laya.Agent` from a process holding onnxruntime and numpy and **neither torch
+nor transformers**. Spec: `docs/superpowers/specs/2026-09-21-laya-onnx-port.md`. Plan:
+`docs/superpowers/plans/2026-09-21-laya-onnx-port.md`. Measurements and their provenance live in
+`laya_onnx/README.md`, which is the evidence document for this package the way the root README is
+for `laya/`.
+
+**`laya/` is not to be edited by ONNX work.** That was a hard constraint of the port and it
+stays one. `laya` is the upstream package and the fork's value is that it remains a clean
+downstream of `NandhaKishorM/laya`; a refactor of `laya/common.py` "so the ONNX side can import
+it" trades that away for a few saved lines. The same applies to `tests/` for the `laya/` suites.
+
+**Vendoring, and the test that makes it safe.** `laya_onnx/sequence.py` is a copy of
+`laya/common.py:15-86` (laya 0.3.5), not an import, because `laya.common` imports torch at module
+scope and importing it would drag torch into the one process that exists to not have it. Vendored
+code rots silently, so `tests/test_onnx_sequence.py` imports *both* implementations and asserts
+they produce identical output over a fixture set spanning all three qtypes, the truncating and
+non-truncating paths, `truncate_left`, and an option head crowded past `head_max_len` — change
+`build_sequence` upstream and that test fails rather than the two paths quietly disagreeing. It
+is behavioural equality, not a source-text diff, so a refactor upstream that preserves behaviour
+passes. **If you edit `laya_onnx/sequence.py` for any reason other than tracking upstream, you
+have broken the thing the test is protecting.**
+
+**The no-torch constraint is enforced, not documented.** `tests/test_onnx_no_torch.py` clears
+`torch`, `transformers`, `laya` and `laya_onnx` out of `sys.modules`, imports `laya_onnx`, and
+asserts none of the first three came back — plus a second check that installs an import hook, so
+a module that imports torch inside a `try: ... except ImportError: pass` guard is caught by name
+at the moment it asks, not missed because the `sys.modules` scan ran after the cleanup. This is
+why `laya_onnx/__init__.py` imports only `runtime` and `truncation`: `laya_onnx.export` may import
+torch (it is the export path) and `laya_onnx.bench` pulls it in transitively through
+`laya.common.ece_score`, so neither is re-exported at package level. Adding a convenience
+re-export of either to `__init__.py` fails that test, which is the point.
+
+**Ship fp32.** The int8 build is reproducible and stays in the tree, but it is measurably worse
+where it matters: `noul:2` accuracy 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled p = 3.1e-05),
+while ECE does not clearly separate the two graphs. On the benchmark host it bought 4–23%
+latency and ~4x less disk. That is not a trade worth taking for a decision model whose output is
+a label. `laya_onnx/README.md` has the full study, including what was ruled out (the embedding
+table) and what was never tried (per-layer exclusion, static calibration, per-channel weights) —
+those are labelled hypotheses there and should stay labelled.
+
+**An export is two files.** `export_fp32` writes `model.onnx` (~2.8 MB of graph) *and*
+`model.onnx.data` (~1.29 GB of initializers); the weights exceed protobuf's message ceiling, so
+external data is not optional. Copying only `model.onnx` deploys a model that cannot run. The
+exporter verifies the pairing at write time; `OnnxSession.__init__` does **not**, so a missing
+sidecar surfaces at serving time as a raw onnxruntime external-data error that says nothing
+about the export. Known rough edge — if you improve one thing here, improve that.
+
+**Confidence from this checkpoint is not calibrated.** `laya-multilingual` ships
+`temperature_by_options: {}`. The port fitted the first temperatures it has ever had, but only
+**4 of 9 reachable buckets**, on five **English** suites, with `noul:2` landing at 4.9490 on the
+int8 graph — 99% of the way to the 5.0 clamp, which `rail_status` reports as `near_rail` and
+which should not be read as converged. `write_temperatures` records that coverage under
+`temperature_by_options_provenance`. Do not write code or docs that treat `confidence` from this
+checkpoint as calibrated.
+
+**Latency is measured, and it is not a speed win.** `laya_onnx/bench/bench_latency.py` reports
+nearest-rank p50/p95 over 50 runs after 5 warmup runs (the first call at a given input *shape*
+pays onnxruntime's graph setup, and all three axes here are dynamic). On the one host measured —
+dual Xeon Gold 6148, onnxruntime 1.27.0 CPU — fp32 ONNX is 164.5 ms p50 at 1 question against
+torch's 175.4 ms on the same machine, and **slower** above that: 1.40x at 5 questions, 1.81x at
+50. The reason to take this port is the dependency surface, not throughput. Those numbers are
+one machine's and do not generalize; the README says so and any new claim should too.
+
 ## Testing
 
 Tests are **standalone scripts, not pytest**. Each collects `PASS`/`FAIL` lists, prints a
@@ -99,20 +176,44 @@ python tests/test_shortlist.py       # shortlist with a fake embed_fn, mocked pr
 python tests/test_decision_model.py  # DecisionModel.forward on a tiny from-config BERT
 python tests/test_packaging.py       # pyproject metadata vs. real dependency floors
 python tests/test_email.py           # email body cleaning regressions
+
+python tests/test_onnx_sequence.py      # vendored build_sequence still matches laya/common.py
+python tests/test_onnx_truncation.py    # truncation_report arithmetic
+python tests/test_onnx_tokenizer.py     # TokenizerAdapter vs. transformers' behaviour
+python tests/test_onnx_postprocess.py   # logits -> answers, temperature clamping
+python tests/test_onnx_export.py        # export guards by inspection (no weights needed)
+python tests/test_onnx_runtime.py       # OnnxAgent: config-required budget, k<2 rejection
+python tests/test_onnx_calibration.py   # int8 study: binning, McNemar, rail_status
+python tests/test_onnx_no_torch.py      # `import laya_onnx` must not pull torch in
 ```
 
-All seven run offline and are wired into both `ci.yml` and `release.yml` — **a new test file
-must be added to both workflows**, or it never runs.
+All fifteen run offline and are wired into both `ci.yml` and `release.yml` — **a new test file
+must be added to both workflows**, or it never runs. The eight ONNX suites sit in one step in
+each workflow, prefixed by `pip install onnx onnxruntime tokenizers`; torch and transformers
+arrive with `pip install -e .`, and `onnxscript` is deliberately absent because no offline test
+runs the dynamo exporter.
 
-`tests/test_local_e2e.py` is the exception: it needs real weights on disk (`~/laya_models` by
-default, or pass a root as `argv[1]`; `LAYA_DEVICE` selects the device) and is **not** in CI.
-Run it manually when touching the forward path.
+Two exceptions need real weights on disk and are **not** in CI. Run them by hand when touching
+the forward path:
+
+- `tests/test_local_e2e.py` — the torch path (`~/laya_models` by default, or a root as `argv[1]`;
+  `LAYA_DEVICE` selects the device).
+- `tests/test_onnx_local_e2e.py` — the ONNX path against torch on the same weights. This is the
+  test behind the **3.719e-05** max-|delta| parity figure in `laya_onnx/README.md`; nothing in
+  CI reproduces that number, so changing the forward path without running this file means the
+  claim is no longer being checked by anything.
+
+**Known pre-existing failure on Windows.** `tests/test_download.py` fails 5 cases locally:
+`tests/test_download.py:52` builds expected paths with `str(p.relative_to(...))` (backslashes on
+Windows) and compares them at `:95` against `as_posix()` values. It is a path-separator bug in
+the test harness, not in `laya/`, and Linux CI is unaffected. Don't "fix" it as part of unrelated
+work, and don't let it mask the rest — run the suites so one failure doesn't stop the run.
 
 Lint locally the way CI does:
 
 ```bash
-ruff check laya/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
-python -m compileall -q laya/ tests/
+ruff check laya/ laya_onnx/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
+python -m compileall -q laya/ laya_onnx/ tests/
 ```
 
 ## Diagrams

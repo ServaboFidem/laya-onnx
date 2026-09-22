@@ -8,6 +8,128 @@ neither torch nor transformers.
 The fp32 export is verified against the torch path on real weights: max |delta| on the logits is
 **3.719e-05** (`tests/test_onnx_local_e2e.py`, run manually — it needs weights on disk).
 
+**Ship the fp32 export.** The int8 build is in the tree, is reproducible, and is measurably
+worse where it matters: `noul:2` accuracy falls 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled
+p = 3.1e-05), while ECE does not clearly separate the two graphs. The section below has the
+full study. The latency table below is the other half of that decision — on the machine
+measured here, int8 bought 6–18% and cost the labels.
+
+## An export is two files, not one
+
+`export_fp32` writes `model.onnx` **and** `model.onnx.data`, because the mmBERT-base weights
+(~1.29 GB) exceed protobuf's 2 GB message limit well before you get to a single-file
+serialization that onnx can load safely. `model.onnx` alone is ~2.8 MB of graph structure with
+every initializer pointing at the sidecar. Copy only `model.onnx` to a serving host and you
+deploy a model that cannot run — and the failure arrives at `OnnxSession.__init__`, as a raw
+onnxruntime error about a missing external-data file, not as anything that mentions the
+export. **That is a known rough edge**: the exporter enforces the pairing at write time, the
+session does not re-check it at load time. Treat the export directory as the unit of
+deployment:
+
+```
+<export_dir>/
+  model.onnx                 # graph, ~2.8 MB
+  model.onnx.data            # external initializers, ~1.29 GB -- required
+  rl_agent_config.json       # max_len / head_max_len / temperatures -- required
+  tokenizer/                 # required
+```
+
+`rl_agent_config.json` is equally required and fails better: `OnnxAgent.__init__` raises
+`FileNotFoundError` naming the file if it is absent, and `ValueError` naming the missing key if
+`max_len` or `head_max_len` is not in it. It never falls back to a default token budget, because
+the wrong budget truncates the state silently instead of erroring (see `laya_onnx/runtime.py`'s
+module docstring for why a 1024 default would be actively dangerous against a 512-token graph).
+
+## Latency
+
+One `system_one` call answers N typed questions about one state in one forward pass, so the
+curve worth knowing is latency vs. questions per call. `laya_onnx/bench/bench_latency.py`
+measures it: 5 discarded warmup runs (the first call with a given input *shape* pays
+onnxruntime's fusion and arena setup, and all three axes here are dynamic), then 50 timed runs,
+reported as nearest-rank p50 and p95 so every figure is a latency that was actually observed.
+
+Reproduce with:
+
+```bash
+python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual --runs 50 --warmup 5
+```
+
+**Measured on one machine, and these numbers do not generalize.** Dual Intel Xeon Gold 6148
+@ 2.40 GHz (40 physical cores / 80 logical, two sockets), Windows 11 26200, Python 3.13.9,
+onnxruntime 1.27.0 (CPUExecutionProvider), numpy 2.3.4, torch 2.10.0+cpu. A dual-socket host is
+close to the worst case for onnxruntime's default thread pool, which sizes itself to every
+physical core and then pays NUMA traffic for the privilege; a 4-core container will produce a
+different shape of curve, not just a shifted one.
+
+fp32, onnxruntime's default thread count:
+
+| questions per call | p50 ms | p95 ms |
+|---|---|---|
+| 1 | 164.5 | 169.5 |
+| 5 | 627.4 | 681.6 |
+| 10 | 1201.2 | 1288.3 |
+| 50 | 6689.7 | 6871.5 |
+
+Run-to-run variation across full repeats of the table was within about 6% at every question
+count (e.g. 1 question: 164.5 and 155.0 p50 on two runs), so read these to two significant
+figures, not four.
+
+**At 1 question, fp32 ONNX lands at 164.5 ms p50 — inside the README's 193–464 ms torch-CPU
+band, at the fast end.** That comparison is weaker than it looks: the README does not say what
+machine produced 193–464 ms, so it is a published figure rather than a measurement anyone can
+line up against this one. The comparison that *is* controlled is the same-machine one below.
+
+### Same machine, torch vs. ONNX
+
+`laya.load("convaiinnovations/laya", subfolder="multilingual", device="cpu")`, identical state,
+identical questions, same 5-warmup/50-run protocol, same host, each library at its own default
+thread count:
+
+| questions per call | torch p50 | ONNX fp32 p50 | ONNX vs. torch |
+|---|---|---|---|
+| 1 | 175.4 ms | 164.5 ms | **0.94x** (ONNX faster) |
+| 5 | 447.8 ms | 627.4 ms | 1.40x (ONNX slower) |
+| 10 | 1135.6 ms | 1201.2 ms | 1.06x (ONNX slower) |
+| 50 | 3689.5 ms | 6689.7 ms | **1.81x** (ONNX slower) |
+
+**The ONNX port is not a speed win on this host, and above one question per call it is a
+loss.** That is worth saying plainly, because "export to ONNX" is usually pitched as an
+optimization. The reason to take this port is the one in the package docstring: a serving
+process with onnxruntime and numpy and *neither torch nor transformers*, which is a smaller
+image, a faster cold start and a much smaller dependency surface. Latency parity at N=1 is the
+bar it has to clear, and it clears it; throughput at N=50 is a cost it currently pays. The
+likely cause is that torch's CPU GEMM path batches better than onnxruntime's on this two-socket
+machine, but nothing here measures that, so it stays a hypothesis.
+
+### Thread count
+
+fp32 again, with `threads=8` (`OnnxSession` sets `intra_op_num_threads`), which is closer to a
+CPU-quota'd container than the 80-way default:
+
+| questions per call | p50 ms (ORT default) | p50 ms (threads=8) |
+|---|---|---|
+| 1 | 164.5 | 153.0 |
+| 5 | 627.4 | 737.2 |
+| 10 | 1201.2 | 1460.7 |
+| 50 | 6689.7 | 8309.1 |
+
+Eight threads is the better setting for single-question calls on this host and the worse one
+for batched calls. There is no default that is right for both; pass `threads=` deliberately,
+especially under a process pool, where leaving it unset gives every worker a full-width pool.
+
+### int8, for completeness — still not recommended
+
+| questions per call | fp32 p50 | int8 p50 | speedup |
+|---|---|---|---|
+| 1 | 164.5 | 134.2 | 1.23x |
+| 5 | 627.4 | 598.0 | 1.05x |
+| 10 | 1201.2 | 1153.3 | 1.04x |
+| 50 | 6689.7 | 6262.4 | 1.07x |
+
+int8 is 4–23% faster and ~4x smaller on disk (325 MB in one file, versus 1.29 GB in two), and it
+loses `noul:2` accuracy 0.8833 → 0.7800 at p = 1.6e-06. That is the trade, measured; the next
+section is why it is not worth taking.
+
 ## int8 quantization: measured, and not recommended
 
 `laya_onnx/export/quantize_int8.py` produces a dynamically quantized int8 copy of an fp32

@@ -19,6 +19,9 @@ permissions:
 env:
   USE_TF: "0"
   USE_TORCH: "1"
+  # The ONNX suites build real `tokenizers` objects; the fork-safety warning they otherwise
+  # print on every call is noise in a release log. ci.yml already sets this.
+  TOKENIZERS_PARALLELISM: "false"
 
 jobs:
   build:
@@ -44,6 +47,21 @@ jobs:
           python tests/test_shortlist.py
           python tests/test_decision_model.py
           python tests/test_packaging.py
+
+      # The eight offline ONNX suites, the same set ci.yml runs. Both workflows must carry every
+      # suite: a test wired into only one of them silently stops guarding a release.
+      # tests/test_onnx_local_e2e.py stays out here too -- it needs real weights on disk.
+      - name: ONNX tests must pass before anything is published
+        run: |
+          pip install onnx onnxruntime tokenizers
+          python tests/test_onnx_sequence.py
+          python tests/test_onnx_truncation.py
+          python tests/test_onnx_tokenizer.py
+          python tests/test_onnx_postprocess.py
+          python tests/test_onnx_export.py
+          python tests/test_onnx_runtime.py
+          python tests/test_onnx_calibration.py
+          python tests/test_onnx_no_torch.py
 
       - name: Build
         run: python -m build

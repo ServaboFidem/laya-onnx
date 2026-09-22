@@ -32,8 +32,44 @@ dependencies = [
     "numpy>=1.20.0",
 ]
 
+[project.optional-dependencies]
+# The ONNX *serving* path (`laya_onnx.load`, `OnnxAgent.predict`). Deliberately excludes torch,
+# transformers and `onnx` itself: the whole point of laya_onnx is a process that holds none of
+# them, and tests/test_onnx_no_torch.py fails the build if one creeps back in. numpy is already a
+# core dependency and is repeated here only so this extra reads as a complete description of what
+# the runtime needs. These floors are the ones declared in the port's plan, not measured here;
+# what *is* measured is that the shipped export runs on onnxruntime 1.27.0, tokenizers 0.22.2 and
+# numpy 2.3.4 (laya_onnx/README.md's benchmark table records the exact environment).
+onnx = [
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
+    "numpy>=1.20.0",
+]
+# The ONNX *export* path (`python -m laya_onnx.export.export_fp32`), which runs once, offline,
+# and is the one place under laya_onnx/ that may import torch. `onnxscript` is not optional
+# within this extra: export_fp32 passes `dynamo=True`, which is the only exporter that keeps all
+# three axes symbolic (see laya_onnx/export/export_fp32.py:228-244), and that exporter is
+# implemented on top of onnxscript. These floors are the versions the shipped fp32 export was
+# actually produced and verified with -- known-good, not a measured minimum; older releases are
+# untested here rather than known to fail.
+onnx-export = [
+    "onnx>=1.23",
+    "onnxscript>=0.7",
+    "onnxruntime>=1.17",
+    "torch>=2.10",
+    "transformers>=4.48.0",
+]
+# There is deliberately no `onnx-bench` extra. `laya_onnx/bench/eval_ece.py` needs `datasets`
+# only inside its `__main__` block, to download the five English suites the calibration study
+# used; `measure_ece()` and `refit()` take the labelled examples as an argument and never fetch
+# anything (laya_onnx/bench/__init__.py states that rule). An extra would imply the package
+# depends on `datasets`, which it does not.
+
 [tool.setuptools]
 # assets/, research/ and notebooks/ sit in the root, so auto-discovery bails out.
+# `laya_onnx` is deliberately NOT listed: shipping it in the wheel is a separate decision that
+# changes what tests/test_packaging.py has to assert about the extras above. It is importable
+# from a checkout, which is what the ONNX tests and the benchmark use.
 packages = ["laya"]
 
 [project.urls]
