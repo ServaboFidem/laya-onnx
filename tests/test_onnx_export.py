@@ -1,4 +1,5 @@
 """Export a tiny DecisionModel and check the ONNX graph matches torch."""
+import inspect
 import os
 import shutil
 import sys
@@ -17,7 +18,9 @@ import torch                                                # noqa: E402
 from transformers import AutoConfig, AutoModel              # noqa: E402
 
 from laya.common import DecisionModel                       # noqa: E402
-from laya_onnx.export.export_fp32 import _copy_sidecars, _verify_opset, export_fp32   # noqa: E402
+from laya_onnx.export.export_fp32 import (  # noqa: E402
+    _build_parser, _copy_sidecars, _external_data_files, _verify_opset, export_fp32,
+)
 from laya_onnx.session import OnnxSession                   # noqa: E402
 
 PASS, FAIL = [], []
@@ -54,7 +57,11 @@ def sample(batch=2, seq=32, markers=3, vocab=256, seed=0):
 tmp = tempfile.mkdtemp()
 try:
     model = tiny_model()
-    path = export_fp32(model, os.path.join(tmp, "model.onnx"))
+    # opset=17 is passed EXPLICITLY. It is no longer the default (18 is), because 17 is
+    # unreachable for mmBERT -- see export_fp32's docstring. This tiny BERT is small enough
+    # that the down-converter succeeds on it, which is exactly why it stays here: it is the
+    # only place the down-conversion path gets exercised at all.
+    path = export_fp32(model, os.path.join(tmp, "model.onnx"), opset=17)
     check("export/file-exists", os.path.exists(path))
 
     # The written artifact must really be opset 17, not merely have been asked for it. torch
@@ -62,6 +69,15 @@ try:
     # to give up and leave the file at 18 without raising.
     declared = [o.version for o in onnx.load(path).opset_import if o.domain in ("", "ai.onnx")]
     check("export/opset-is-17", declared == [17], "got %s" % declared)
+
+    # The default must be 18. A default of 17 is a trap: on the checkpoint this port actually
+    # ships it produces a graph that declares 17, fails to validate against 17, and is
+    # rejected by onnxruntime -- i.e. it can only ever trip our own guard.
+    check("export/default-opset-is-18",
+          inspect.signature(export_fp32).parameters["opset"].default == 18,
+          "got %r" % inspect.signature(export_fp32).parameters["opset"].default)
+    check("export/cli-default-opset-is-18", _build_parser().get_default("opset") == 18,
+          "got %r" % _build_parser().get_default("opset"))
 
     # ...and the guard that enforces it has to actually fire, or it is decoration.
     try:
@@ -131,6 +147,95 @@ try:
           and os.path.exists(os.path.join(out, "tokenizer", "tokenizer.json")))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+
+# ------------------------------------------------------------------ _verify_opset branches
+# The two guards added after the real mmBERT export are tested here against hand-built
+# graphs, not against a real export. That is deliberate and necessary: the tiny BERT above
+# takes the same C-API fallback path and happens to down-convert *successfully*, so no export
+# this suite can afford structurally reaches either branch. Without these, the guard that
+# caught the opset-17 disaster would itself be untested.
+
+def _tiny_proto(opset, nodes, inputs, outputs, initializers=()):
+    graph = onnx.helper.make_graph(list(nodes), "g", list(inputs), list(outputs),
+                                   initializer=list(initializers))
+    m = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", opset)])
+    m.ir_version = 9
+    return m
+
+
+tmp_guard = tempfile.mkdtemp()
+try:
+    # (a) the exact shape the real failure had: a header claiming opset 17 over a node using
+    # `num_outputs`, an attribute Split only gained in opset 18. The old guard read the header
+    # and passed this; onnxruntime rejected it as INVALID_GRAPH at session creation.
+    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [4])
+    y1 = onnx.helper.make_tensor_value_info("Y1", onnx.TensorProto.FLOAT, [2])
+    y2 = onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [2])
+    split = onnx.helper.make_node("Split", ["X"], ["Y1", "Y2"], name="node_Split_31",
+                                  num_outputs=2)
+    bad = os.path.join(tmp_guard, "bad_split.onnx")
+    onnx.save(_tiny_proto(17, [split], [x], [y1, y2]), bad)
+
+    declared_bad = [o.version for o in onnx.load(bad).opset_import if o.domain in ("", "ai.onnx")]
+    check("guard/fixture-really-declares-17", declared_bad == [17], "got %s" % declared_bad)
+    try:
+        _verify_opset(bad, 17)
+        check("guard/invalid-node-raises", False,
+              "accepted a graph declaring 17 that does not validate against 17")
+    except RuntimeError as e:
+        check("guard/invalid-node-raises", True)
+        # The message has to name what is wrong, or it sends the reader back to onnxruntime.
+        check("guard/invalid-node-message-names-attribute", "num_outputs" in str(e), str(e)[:120])
+        check("guard/invalid-node-message-names-node", "Split" in str(e), str(e)[:120])
+
+    # (b) a graph at an opset it genuinely satisfies must pass -- otherwise (a) proves nothing
+    # beyond "the guard raises on everything".
+    relu = onnx.helper.make_node("Relu", ["X"], ["Z"], name="node_Relu_0")
+    z = onnx.helper.make_tensor_value_info("Z", onnx.TensorProto.FLOAT, [4])
+    good = os.path.join(tmp_guard, "good.onnx")
+    onnx.save(_tiny_proto(17, [relu], [x], [z]), good)
+    try:
+        check("guard/valid-graph-passes", _verify_opset(good, 17) == 17)
+    except Exception as e:
+        check("guard/valid-graph-passes", False, "%s: %s" % (type(e).__name__, e))
+
+    # (c) missing external data. This must be diagnosed as a missing sidecar, and must be
+    # diagnosed BEFORE onnx.checker runs -- check_model resolves external data itself, so if
+    # the checker went first the failure would arrive as a non-ValidationError that escapes
+    # the RuntimeError handler entirely and reaches the caller as a raw onnx error.
+    w = onnx.helper.make_tensor("W", onnx.TensorProto.FLOAT, [4], vals=[0.0, 0.0, 0.0, 0.0])
+    # Strip the inlined bytes and point the tensor at a sibling file instead, which is the
+    # shape torch writes for any export past protobuf's 2 GB ceiling.
+    w.ClearField("float_data")
+    w.data_location = onnx.TensorProto.EXTERNAL
+    w.external_data.add(key="location", value="model.onnx.data")
+    w.external_data.add(key="offset", value="0")
+    w.external_data.add(key="length", value="16")
+    add = onnx.helper.make_node("Add", ["X", "W"], ["Z"], name="node_Add_0")
+    ext = os.path.join(tmp_guard, "ext.onnx")
+    onnx.save(_tiny_proto(17, [add], [x], [z], initializers=[w]), ext)
+
+    found = _external_data_files(onnx.load(ext, load_external_data=False), ext)
+    check("guard/external-data-discovered",
+          found == [os.path.join(tmp_guard, "model.onnx.data")], "got %s" % found)
+    try:
+        _verify_opset(ext, 17)
+        check("guard/missing-external-data-raises", False, "accepted a graph with absent weights")
+    except FileNotFoundError as e:
+        check("guard/missing-external-data-raises", True)
+        check("guard/missing-external-data-names-the-file", "model.onnx.data" in str(e), str(e)[:140])
+    except Exception as e:
+        # Anything other than FileNotFoundError means the checker got there first, which is
+        # the ordering bug this case exists to pin down.
+        check("guard/missing-external-data-raises", False,
+              "wrong exception type %s: %s" % (type(e).__name__, str(e)[:100]))
+
+    # (d) a graph with no external data at all reports none -- the summary line in main()
+    # iterates this, and a false positive there would print a file that does not exist.
+    check("guard/no-external-data-reports-none",
+          _external_data_files(onnx.load(good, load_external_data=False), good) == [])
+finally:
+    shutil.rmtree(tmp_guard, ignore_errors=True)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:

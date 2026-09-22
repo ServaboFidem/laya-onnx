@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 
+import onnx
 import torch
 
 # ModernBERT's encoder config defaults `reference_compile` to "auto", which routes the forward
@@ -53,6 +54,30 @@ class ExportWrapper(torch.nn.Module):
         return self.model(input_ids, attention_mask, marker_pos, marker_mask, qtype)
 
 
+def _external_data_files(model, path: str) -> list:
+    """Absolute paths of the external-data files `model` references, first-seen order.
+
+    `model` must have been loaded with `load_external_data=False`, so the initializers still
+    carry their `external_data` entries rather than inlined bytes.
+
+    Only top-level graph initializers are walked. That is not a general-purpose ONNX utility
+    and is not meant to be: torch's exporter writes every weight as a top-level initializer of
+    the main graph, and this function exists to check *this* exporter's own output, not to
+    survive arbitrary graphs. A subgraph-nested external tensor would be missed, which would
+    cost us the friendly error below and nothing else - the checker and onnxruntime still fail.
+    """
+    base = os.path.dirname(os.path.abspath(path))
+    seen, out = set(), []
+    for tensor in model.graph.initializer:
+        if tensor.data_location != onnx.TensorProto.EXTERNAL:
+            continue
+        for kv in tensor.external_data:
+            if kv.key == "location" and kv.value not in seen:
+                seen.add(kv.value)
+                out.append(os.path.join(base, kv.value))
+    return out
+
+
 def _verify_opset(path: str, want: int) -> int:
     """Raise unless the file at `path` really declares opset `want` *and* validates against it.
 
@@ -69,8 +94,6 @@ def _verify_opset(path: str, want: int) -> int:
     land in Task 8 as a runtime incompatibility on some other host rather than here as an export
     that refused to finish. So: read the artifact back and make the mismatch loud.
     """
-    import onnx
-
     model = onnx.load(path, load_external_data=False)
     # The default ONNX domain is spelled "" (and, historically, "ai.onnx"); custom-op domains
     # carry their own independent versions and are not what `opset_version` controls.
@@ -98,10 +121,31 @@ def _verify_opset(path: str, want: int) -> int:
     # exactly this, here, on the machine doing the export. It is preferred over an
     # onnxruntime load because the exporter must not acquire a runtime dependency just to
     # check itself, and because the checker names the offending node rather than the file.
+
+    # External data first, and deliberately before the checker. An fp32 mmBERT export is
+    # ~1.29 GB, far past protobuf's 2 GB message ceiling, so torch splits it: `model.onnx` is a
+    # ~2.8 MB graph and `model.onnx.data` beside it holds 99.8% of the bytes. The two travel
+    # together or not at all.
     #
+    # This check has to run first because `onnx.checker.check_model(path)` *resolves* external
+    # data itself. With the `.data` file absent it raises something that is not a
+    # ValidationError, sails straight past the `except` below, and reaches the caller as a raw
+    # onnx error about a missing file - which is precisely the unhelpful failure this is here
+    # to replace. Checking first means a missing sidecar is diagnosed as a missing sidecar.
+    for ext in _external_data_files(model, path):
+        if not os.path.exists(ext):
+            raise FileNotFoundError(
+                "exported %s references external data %r, which is not there. The graph and "
+                "its weights are two files and must be deployed together - copying model.onnx "
+                "alone gives you a 2.8 MB graph with no weights, and onnxruntime will fail at "
+                "session creation on the serving host rather than here."
+                % (path, os.path.basename(ext))
+            )
+
     # `check_model` is given the path, not the loaded proto: these graphs exceed the 2 GB
     # protobuf ceiling and carry their weights in a sibling `.data` file, which only the
-    # path-taking form knows how to resolve.
+    # path-taking form knows how to resolve -- and which the loop above has just confirmed
+    # is actually there.
     try:
         onnx.checker.check_model(path, full_check=False)
     except onnx.checker.ValidationError as exc:
@@ -116,10 +160,19 @@ def _verify_opset(path: str, want: int) -> int:
     return got[0]
 
 
-def export_fp32(model, out_path: str, opset: int = 17) -> str:
+def export_fp32(model, out_path: str, opset: int = 18) -> str:
     """Trace `model` to ONNX at `out_path`, with batch, sequence and marker axes dynamic.
 
     Returns the path written, so a caller can chain on it.
+
+    The default is 18 because 17 is unreachable for the encoders this port actually ships.
+    torch.export captures at 18; asking for 17 hands the graph to a version converter that,
+    on mmBERT, falls back to the onnx C API, rewrites the header to 17 and leaves a
+    `Split(num_outputs=2)` node - an opset-18 attribute - in place. The result declares 17,
+    does not validate against 17, and onnxruntime rejects it as INVALID_GRAPH. `_verify_opset`
+    now catches that, but a default that can only ever trip our own guard is a trap, not a
+    conservative choice. Pass `opset=17` explicitly if you want to exercise down-conversion on
+    a model small enough for it to succeed.
     """
     model.eval()
     _disable_reference_compile(model)
@@ -232,6 +285,25 @@ def _copy_sidecars(model_dir: str, out_dir: str) -> list:
     return copied
 
 
+def _build_parser():
+    """The CLI's argument parser, built here rather than inline in `main()`.
+
+    Extracted purely so a test can assert what the CLI defaults to without needing weights:
+    `main()` parses and then immediately reaches for a checkpoint, so there is no way to
+    observe its defaults by calling it. A test that rebuilt an equivalent parser of its own
+    would assert nothing at all -- it would compare a hardcoded default against itself.
+    """
+    ap = argparse.ArgumentParser(description="Export a laya checkpoint to fp32 ONNX.")
+    ap.add_argument("--model-dir", required=True,
+                    help="directory holding rl_agent_config.json, model.safetensors and tokenizer/")
+    ap.add_argument("--out", required=True, help="output directory for model.onnx and its sidecars")
+    # Defaults to 18, matching export_fp32 -- see its docstring: 17 cannot be reached for
+    # mmBERT and only produces an artifact this module's own guard rejects.
+    ap.add_argument("--opset", type=int, default=18,
+                    help="ONNX opset to write (default 18; 17 is unreachable for mmBERT)")
+    return ap
+
+
 def main(argv=None) -> int:
     # Import inside main() so the module stays importable (and `export_fp32` usable against a
     # model you already hold) without transformers or safetensors being present.
@@ -239,12 +311,7 @@ def main(argv=None) -> int:
 
     from laya.common import build_model
 
-    ap = argparse.ArgumentParser(description="Export a laya checkpoint to fp32 ONNX.")
-    ap.add_argument("--model-dir", required=True,
-                    help="directory holding rl_agent_config.json, model.safetensors and tokenizer/")
-    ap.add_argument("--out", required=True, help="output directory for model.onnx and its sidecars")
-    ap.add_argument("--opset", type=int, default=17)
-    args = ap.parse_args(argv)
+    args = _build_parser().parse_args(argv)
 
     model_dir, out_dir = args.model_dir, args.out
     cfg_path = os.path.join(model_dir, "rl_agent_config.json")
@@ -275,6 +342,12 @@ def main(argv=None) -> int:
 
     print("wrote %s (opset %d, reference_compile %s)"
           % (out_path, args.opset, "disabled" if had_compile_flag else "absent"))
+    # Name the weights file explicitly. It is 99.8% of the export and it is easy to miss:
+    # `model.onnx` alone looks like a complete artifact at 2.8 MB, and a deploy that copies
+    # only the three documented names ships a graph with no weights in it.
+    for ext in _external_data_files(onnx.load(out_path, load_external_data=False), out_path):
+        print("wrote %s (external weights -- deploy it beside model.onnx, it is not optional)"
+              % ext)
     # `copied` is never empty: `_copy_sidecars` raises rather than skipping a missing sidecar.
     print("copied alongside: %s" % ", ".join(copied))
     return 0

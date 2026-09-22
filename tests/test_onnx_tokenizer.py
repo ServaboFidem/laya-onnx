@@ -92,9 +92,15 @@ def make_gemma_quirk_checkpoint(tmp):
     has to rewrite the file before AutoTokenizer ever sees it).
 
     TokenizerAdapter must construct and tokenize correctly against this checkpoint WITHOUT
-    that rewrite step -- because it never reads tokenizer_config.json at all. This is the
-    thing that proves the sidestep, rather than merely assuming it because the brief's
-    fixture never wrote the file in the first place.
+    that rewrite step. It does now READ tokenizer_config.json -- it has to, since the real
+    multilingual checkpoint declares its special tokens nowhere else -- so the protection is
+    no longer "never opens the file". It is narrower and worth stating exactly: the adapter
+    reads only the four special-token name keys and never looks at `extra_special_tokens`, so
+    the list shape cannot reach anything that cares about it.
+
+    That makes this fixture more load-bearing than it was, not less. It is the only case
+    where the quirky config is actually parsed by the adapter, so it is what stands between
+    us and a future change that starts consuming the rest of that file.
     """
     tokdir = os.path.join(tmp, "tokenizer")
     make_vocab_tokenizer(tokdir)
@@ -104,10 +110,17 @@ def make_gemma_quirk_checkpoint(tmp):
     # The quirky config: a list of extra special tokens, plus no explicit tokenizer_class,
     # mirroring what a real mmBERT/Gemma checkpoint ships and what _fix_tokenizer_config
     # exists to repair for transformers. TokenizerAdapter must not need that repair.
+    #
+    # It also declares a live special token. Without one the adapter would parse this file
+    # and take nothing from it, so the expectations below would be satisfied entirely by
+    # special_tokens_map.json and the case would not actually exercise reading a quirky
+    # config -- which is the shape that broke us. With `mask_token` here, resolving the mask
+    # requires reading past the list-shaped `extra_special_tokens` sitting in the same file.
     with open(os.path.join(tokdir, "tokenizer_config.json"), "w") as f:
         json.dump({
             "tokenizer_class": None,
             "extra_special_tokens": ["<extra_id_0>", "<extra_id_1>", "<extra_id_2>"],
+            "mask_token": "[MASK]",
         }, f)
     return tmp
 

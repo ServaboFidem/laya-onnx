@@ -12,9 +12,16 @@ Produce the ONNX side with:
                print(snapshot_download('convaiinnovations/laya', allow_patterns=['multilingual/*']))"
     python -m laya_onnx.export.export_fp32 \\
         --model-dir <snapshot>/multilingual \\
-        --out ~/laya_onnx_models/multilingual --opset 18
+        --out ~/laya_onnx_models/multilingual
 
-Opset 18, not 17. torch.export captures at 18 and asks a converter to walk the graph back
+That writes FOUR things, not three. Alongside `rl_agent_config.json` and `tokenizer/` there
+is `model.onnx` (~2.8 MB, the graph) and `model.onnx.data` (~1.29 GB, every weight). torch
+splits them because an fp32 mmBERT export is far past protobuf 2 GB message ceiling. They
+are one artifact in two files: copy `model.onnx` alone and you have deployed a graph with no
+weights in it. The exporter names the `.data` file on stdout and refuses to finish if it is
+missing, so trust that summary over this docstring.
+
+Opset 18 is the default, and 17 is not an option here. torch.export captures at 18 and asks a converter to walk the graph back
 down; on mmBERT that converter relabels the header to 17 and leaves a `Split(num_outputs=2)`
 node behind, producing a file that declares 17, does not validate against 17, and is rejected
 by onnxruntime at session creation with INVALID_GRAPH. `_verify_opset` now catches that at
@@ -154,7 +161,11 @@ SUITES = {"triage": laya.triage_questions(), "guard": laya.guard_questions(),
 # agreement -- the user-visible contract -- while the *numeric* question is asked separately
 # in section 2, against unrounded logits, where a real divergence has nowhere to hide.
 PROB_TOL = 2e-3
-LOGIT_TOL = 1e-3
+# The spec's fp32 parity bar, not a bar chosen to fit the measurement. Measured here is
+# 3.7e-05, so there is ~27x headroom; the point of pinning it at the spec value rather than
+# somewhere comfortably above it is that a future export which degrades to, say, 9e-4 must
+# fail this suite instead of passing it while violating the spec.
+LOGIT_TOL = 1e-4
 
 
 def collate_for(state, questions):
