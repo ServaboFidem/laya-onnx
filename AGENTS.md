@@ -155,13 +155,19 @@ which should not be read as converged. `write_temperatures` records that coverag
 `temperature_by_options_provenance`. Do not write code or docs that treat `confidence` from this
 checkpoint as calibrated.
 
-**Latency is measured, and it is not a speed win.** `laya_onnx/bench/bench_latency.py` reports
-nearest-rank p50/p95 over 50 runs after 5 warmup runs (the first call at a given input *shape*
-pays onnxruntime's graph setup, and all three axes here are dynamic). On the one host measured —
-dual Xeon Gold 6148, onnxruntime 1.27.0 CPU — fp32 ONNX is 164.5 ms p50 at 1 question against
-torch's 175.4 ms on the same machine, and **slower** above that: 1.40x at 5 questions, 1.81x at
-50. The reason to take this port is the dependency surface, not throughput. Those numbers are
-one machine's and do not generalize; the README says so and any new claim should too.
+**Latency is measured, and on the one host measured it is not a speed win.** Read that scope
+before quoting the sentence: the host is a dual Xeon Gold 6148 (40 cores / 80 threads, two
+sockets), which is close to the opposite of the commodity hardware this port targets, and is
+exactly the regime where torch's threaded MKL kernels do best and onnxruntime's default
+core-wide thread pool does worst. Nobody has measured a 4-core container, and a smaller host may
+well reverse the result.
+
+On that host (onnxruntime 1.27.0, CPUExecutionProvider), fp32 ONNX is 164.5 ms p50 at 1 question
+against torch's 175.4 ms measured the same way on the same machine, and **slower** above that:
+1.40x at 5 questions, 1.81x at 50. The reason to take this port is the dependency surface, not
+throughput. `laya_onnx/bench/bench_latency.py` produces these — nearest-rank p50/p95 over 50
+runs after 5 discarded warmup runs — and `laya_onnx/README.md` carries the full tables with the
+machine block. Any new latency claim gets the same scoping these do.
 
 ## Testing
 

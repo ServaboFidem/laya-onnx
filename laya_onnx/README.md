@@ -6,13 +6,16 @@ return the same answer dicts as `laya.Agent`, from a process that has onnxruntim
 neither torch nor transformers.
 
 The fp32 export is verified against the torch path on real weights: max |delta| on the logits is
-**3.719e-05** (`tests/test_onnx_local_e2e.py`, run manually — it needs weights on disk).
+**3.719e-05** (`tests/test_onnx_local_e2e.py`). That test needs the real weights plus a ~1.3 GB
+export on disk, so it is **not in CI and nothing in CI reproduces this number** — it is run by
+hand. If you change the forward path and do not run it, the figure above has stopped being
+checked by anything.
 
 **Ship the fp32 export.** The int8 build is in the tree, is reproducible, and is measurably
 worse where it matters: `noul:2` accuracy falls 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled
 p = 3.1e-05), while ECE does not clearly separate the two graphs. The section below has the
 full study. The latency table below is the other half of that decision — on the machine
-measured here, int8 bought 6–18% and cost the labels.
+measured here, int8 bought 4–23% and cost the labels.
 
 ## An export is two files, not one
 
@@ -50,9 +53,15 @@ so every figure is a latency that was actually observed.
 The warmup exists because onnxruntime defers part of its setup to the first `run()` at a given
 input *shape*, and all three axes here are dynamic — but on this build the effect is smaller
 than that reasoning suggests, and it is worth saying so rather than implying a big first-call
-penalty. Measured: at 1 question, runs 1–8 were 169, 168, 155, 153, 152, 152, 151, 150 ms — run
-1 is 1.13x run 6 and the series is flat from run 3. At 50 questions: 6884, 6953, 6722, 6860,
-6764, 6676, 6525, 6837 ms — run 1 is 1.03x run 6, inside the run-to-run spread. `warmup=5` is
+penalty. Measured:
+
+- 1 question, runs 1–8: 169, 168, 155, 153, 152, 152, 151, 150 ms. Run 1 over run 6 is
+  169/152 = **1.11x**, and the series has settled by run 3.
+- 50 questions, runs 1–8: 6884, 6953, 6722, 6860, 6764, 6676, 6525, 6837 ms. Run 1 over run 6 is
+  6884/6676 = **1.03x**, inside the run-to-run spread.
+
+Both ratios are computed from the rounded values printed above, so they re-derive exactly; the
+harness printed whole milliseconds for this series and no unrounded copy was kept. `warmup=5` is
 cheap insurance here, not a large correction.
 
 Reproduce with:
@@ -77,12 +86,13 @@ fp32, onnxruntime's default thread count:
 | 10 | 1201.2 | 1288.3 |
 | 50 | 6689.7 | 6871.5 |
 
-Run-to-run variation across full repeats of the table was within about 6% at every question
-count (e.g. 1 question: 164.5 and 155.0 p50 on two runs), so read these to two significant
-figures, not four.
+Run-to-run variation across full repeats of the table was worst at 1 question — 164.5 and 155.0
+p50 on two runs, a 6.1% spread — and under 2% at 5 and 50 questions (627.4 vs. 634.1; 6689.7 vs.
+6752.4). Read these to two significant figures, not four.
 
-**At 1 question, fp32 ONNX lands at 164.5 ms p50 — inside the README's 193–464 ms torch-CPU
-band, at the fast end.** That comparison is weaker than it looks: the README does not say what
+**At 1 question, fp32 ONNX lands at 164.5 ms p50 — below the 193–464 ms torch-CPU band in the
+root README, by 14.8% against its lower bound.** Faster than the band, not inside it. That
+comparison is weaker than it looks: the README does not say what
 machine produced 193–464 ms, so it is a published figure rather than a measurement anyone can
 line up against this one. The comparison that *is* controlled is the same-machine one below.
 

@@ -7,11 +7,13 @@ Why this script exists, and why it is shaped the way it is:
    of that work -- memory-arena sizing, thread-pool spin-up -- until the first `run()` at a
    given input *shape*, and all three axes of this graph are dynamic (batch, sequence, markers),
    so a call with 50 questions does not inherit a call with 1's setup. Measured on the host in
-   `laya_onnx/README.md`'s table, the settling is real but modest: at 1 question, runs 1-8 were
-   169, 168, 155, 153, 152, 152, 151, 150 ms (run 1 is 1.13x run 6, flat from run 3); at 50
-   questions, 6884, 6953, 6722, 6860, 6764, 6676, 6525, 6837 ms (run 1 is 1.03x run 6, inside
-   the run-to-run spread). So `warmup=5` is cheap insurance rather than a large correction --
-   do not quote it as evidence of an expensive first call on this build.
+   `laya_onnx/README.md`'s table, the settling is real but modest. At 1 question, runs 1-8 were
+   169, 168, 155, 153, 152, 152, 151, 150 ms: 169/152 = **1.11x** run 1 over run 6, settled by
+   run 3. At 50 questions, 6884, 6953, 6722, 6860, 6764, 6676, 6525, 6837 ms: 6884/6676 =
+   **1.03x**, inside the run-to-run spread. Both ratios are computed from the rounded values
+   printed here, so a reader can re-derive them; the harness printed whole milliseconds at the
+   time, and no unrounded series was kept. So `warmup=5` is cheap insurance rather than a large
+   correction -- do not quote it as evidence of an expensive first call on this build.
 
 2. **p50 and p95, not mean.** A mean over a CPU inference loop is dominated by whatever else the
    host was doing; the tail is the number a caller actually has to size a timeout against. 50
@@ -46,6 +48,8 @@ from typing import Any, Dict, List, Sequence
 # transformers is not imported anywhere in this path, but a caller may have set neither var and
 # some other library in the process may probe them; keep the repo-wide guards on every entry
 # point regardless (see AGENTS.md).
+_SUMMARY = "Wall-clock latency of OnnxAgent.system_one, by questions per call."
+
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_TORCH", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -161,7 +165,11 @@ def measure(agent, state, qs: Dict[str, Dict[str, Any]], runs: int = 50, warmup:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # `__doc__` is None under `python -OO`, which strips docstrings; `.splitlines()[0]` on it is
+    # an AttributeError that only ever appears in an optimized run, i.e. the one place nobody
+    # tests. _SUMMARY is the same sentence as a real constant. Same fix, and same reason, as
+    # laya_onnx/export/quantize_int8.py:315-318 -- this file regressed it and should not have.
+    ap = argparse.ArgumentParser(description=_SUMMARY)
     ap.add_argument("model_dir", help="a directory produced by laya_onnx.export.export_fp32")
     ap.add_argument("--runs", type=int, default=50, help="timed runs per question count (default 50)")
     ap.add_argument("--warmup", type=int, default=5, help="discarded runs per question count (default 5)")
