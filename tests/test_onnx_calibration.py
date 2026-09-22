@@ -18,6 +18,8 @@ has a `__main__` for that; this file never loads a model.
 The tests below build rows in the shape `collect_logits` returns, which is how a synthetic case
 and a real one stay interchangeable.
 """
+import contextlib
+import io
 import json
 import math
 import os
@@ -44,6 +46,7 @@ from laya_onnx.bench.eval_ece import (                                       # n
     collect_logits,
     conf_correct,
     ece_of,
+    main,
     measure_ece,
     metrics_from_rows,
     paired_ece_gap,
@@ -687,6 +690,61 @@ check("paired/temperature-travels-with-its-graph", asym["ece_b"],
 
 check("paired/conf-correct-shapes", [x.shape for x in conf_correct(shift_a, 1.0)],
       [(200,), (200,)])
+
+
+# --------------------------------------------------- the driver, with an unfittable bucket
+# The regression this exists for: `main()` built its bucket list from the *report* rows, which
+# include buckets `fit_temperatures` refused (too few rows to hold half out), then indexed
+# `result["temps_fp32"][b]` directly for the paired ECE gap. One thin bucket in a study -- the
+# exact situation the unfittable-bucket reporting exists to surface -- and the driver printed
+# four full tables and died on KeyError before emitting a single interval, McNemar result or
+# rail status. The fix routes both temperatures through `temperature_for`, the resolver every
+# other call site already used, which also applies the per-qtype fallback and the clamp that
+# `build_answers` would apply to that bucket in production.
+#
+# Driven through the real `--rows-in` entry point rather than by calling an inner function, so
+# it covers the ordering too: the crash was downstream of output that had already been printed.
+_drv_rows = (
+    [row(QTYPES["noul"], 2, [0.0, 0.4 + 0.02 * i], i % 2, "noul:2") for i in range(40)]
+    # Six rows, under split_rows' min_per_bucket of 20, so this bucket is unfittable by design.
+    + [row(QTYPES["choice"], 4, [1.0, 0.3, -0.2, 0.1 * i], i % 4, "choice:3-5")
+       for i in range(6)]
+)
+with tempfile.TemporaryDirectory() as d:
+    npz = os.path.join(d, "rows.npz")
+    np.savez_compressed(npz, fp32=np.array(_drv_rows, dtype=object),
+                        int8=np.array(_drv_rows, dtype=object))
+    out_json = os.path.join(d, "study.json")
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--rows-in", npz, "--out", out_json])
+        check("driver/unfittable-bucket-does-not-crash", rc, 0)
+    except KeyError as e:
+        FAIL.append("driver/unfittable-bucket-does-not-crash: KeyError %r -- the bucket list "
+                    "comes from the report rows, the temperature mapping does not" % (e,))
+        rc = None
+    if rc == 0:
+        with open(out_json, encoding="utf-8") as f:
+            drv = json.load(f)
+        text = buf.getvalue()
+        # The bucket really was unfittable, or this case proves nothing.
+        check("driver/thin-bucket-reported-unfittable", drv["unfitted_buckets"], ["choice:3-5"])
+        check("driver/thin-bucket-absent-from-temps", "choice:3-5" in drv["temps_fp32"], False)
+        # ...and the sections downstream of the old crash all ran.
+        check("driver/gap-reported-for-the-thin-bucket",
+              "ece_gap" in drv["uncertainty"]["choice:3-5"], True)
+        check("driver/gap-reported-for-the-fitted-bucket",
+              "ece_gap" in drv["uncertainty"]["noul:2"], True)
+        check("driver/mcnemar-reached", sorted(drv["mcnemar"]),
+              ["ALL", "choice:3-5", "noul:2"])
+        check("driver/rail-status-reached", sorted(drv["rail"]), ["fp32", "int8"])
+        check_true("driver/printed-the-unfitted-bucket", "choice:3-5" in text)
+        # The unfittable bucket is scored at what would actually ship for it: the per-qtype
+        # default of 1.0, clamped -- not at some other bucket's fitted temperature.
+        check("driver/thin-bucket-scored-at-the-shipped-default",
+              drv["uncertainty"]["choice:3-5"]["ece_gap"]["ece_a"],
+              round(ece_of([r for r in _drv_rows if r["bucket"] == "choice:3-5"], 1.0), 4))
 
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))

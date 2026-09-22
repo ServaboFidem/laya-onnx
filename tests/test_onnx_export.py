@@ -21,7 +21,7 @@ from laya.common import DecisionModel                       # noqa: E402
 from laya_onnx.export.export_fp32 import (  # noqa: E402
     _build_parser, _copy_sidecars, _external_data_files, _verify_opset, export_fp32,
 )
-from laya_onnx.session import OnnxSession                   # noqa: E402
+from laya_onnx.session import OnnxSession, declared_external_data   # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -234,6 +234,43 @@ try:
     # iterates this, and a false positive there would print a file that does not exist.
     check("guard/no-external-data-reports-none",
           _external_data_files(onnx.load(good, load_external_data=False), good) == [])
+
+    # (e) the *runtime* side of the same hazard. The exporter refused to write an unpaired
+    # artifact; until now nothing refused to load one, so a deployment that copied only
+    # model.onnx got onnxruntime's external-data error out of tensor loading, which says
+    # nothing about the export. `laya_onnx.session` cannot use onnx to find the declared
+    # sidecars (the serving extra ships neither onnx nor torch), so it walks the protobuf
+    # itself -- and the first check below is that its answer is the same one onnx gives.
+    check("session/walker-agrees-with-onnx-on-external-data",
+          declared_external_data(ext) == _external_data_files(
+              onnx.load(ext, load_external_data=False), ext),
+          "%s vs %s" % (declared_external_data(ext),
+                        _external_data_files(onnx.load(ext, load_external_data=False), ext)))
+    check("session/walker-agrees-with-onnx-on-single-file",
+          declared_external_data(good) == [], "got %s" % declared_external_data(good))
+    try:
+        OnnxSession(ext)
+        check("session/missing-external-data-raises", False,
+              "constructed a session over a graph whose weights are absent")
+    except FileNotFoundError as e:
+        check("session/missing-external-data-raises", True)
+        check("session/missing-external-data-names-the-file", "model.onnx.data" in str(e),
+              str(e)[:160])
+        check("session/missing-external-data-names-the-export",
+              "export_fp32" in str(e), str(e)[:160])
+    except Exception as e:
+        # An onnxruntime Fail here means the check did not run first, which is the whole bug.
+        check("session/missing-external-data-raises", False,
+              "wrong exception type %s: %s" % (type(e).__name__, str(e)[:120]))
+
+    # And the guard must not become a second gate: a graph with no external data at all still
+    # loads. Without this, "it raises" would be indistinguishable from "it always raises".
+    try:
+        OnnxSession(good)
+        check("session/single-file-graph-still-loads", True)
+    except Exception as e:
+        check("session/single-file-graph-still-loads", False,
+              "%s: %s" % (type(e).__name__, str(e)[:120]))
 finally:
     shutil.rmtree(tmp_guard, ignore_errors=True)
 

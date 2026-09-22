@@ -671,7 +671,17 @@ def main(argv=None) -> int:
     for b in buckets:
         g32 = [r for r in rep32 if r["bucket"] == b]
         g8 = [r for r in rep8 if r["bucket"] == b]
-        gap = paired_ece_gap(g32, g8, result["temps_fp32"][b], result["temps_int8"][b])
+        # `temperature_for`, not `result["temps_*"][b]`. `buckets` comes from the *report* rows,
+        # which include every bucket `fit_temperatures` refused as unfittable (fewer than
+        # min_per_bucket rows to hold out) -- those buckets are absent from the fitted mappings
+        # by design, and the sections below already handle "in rows, absent from temps". A bare
+        # index here crashed the driver on exactly the run it exists to report: four full tables
+        # printed, then KeyError before a single interval, McNemar result or rail status. The
+        # resolver also applies the same fallback and clamp `build_answers` applies, so an
+        # unfittable bucket is scored at the temperature that would actually ship for it.
+        t32 = temperature_for(g32[0], temp32, result["temps_fp32"])
+        t8 = temperature_for(g8[0], temp8, result["temps_int8"])
+        gap = paired_ece_gap(g32, g8, t32, t8)
         result["uncertainty"][b]["ece_gap"] = gap
         print("  %-13s %4d %9.4f %9.4f %8.4f [%7.4f, %7.4f] %6s %8.4f %8.4f"
               % (b, gap["n"], gap["ece_a"], gap["ece_b"], gap["gap"],

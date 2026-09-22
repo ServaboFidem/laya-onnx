@@ -40,8 +40,16 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..bench.eval_ece import collect_logits, split_rows
 from ..postprocess import TEMP_MAX, TEMP_MIN, clamp_temperature
+
+# `collect_logits` / `split_rows` are imported inside `refit_report`, not here. `..bench.eval_ece`
+# imports `laya.common` for the upstream ECE estimator, which imports torch at module scope --
+# ~2 GB of dependency for a module whose CLI (`python -m laya_onnx.export.refit_temps`) does
+# nothing but write a JSON key into an existing config. That CLI is the one thing under export/
+# a *serving* operator plausibly runs, so `write_temperatures` and `main()` stay reachable
+# without torch installed at all; only `refit`/`refit_report`, which need a live agent and a
+# labelled dataset anyway, pull it in. This file is under export/ and is permitted to import
+# torch -- it just should not do so for free.
 
 # The search range for the *raw* fit, deliberately far wider than the [0.5, 5.0] the result is
 # clamped to. Fitting inside the clamp would make "hit the rail" unobservable: every bucket
@@ -162,6 +170,10 @@ def refit_report(agent, dataset, seed: int = 0,
     every entry converged. So the diagnostics are not deleted, they are moved here, and `refit`
     is a thin wrapper over this.
     """
+    # Deferred: see the note beside this module's imports. Reaching a live agent and a labelled
+    # dataset already implies the measurement environment; `main()`'s JSON write does not.
+    from ..bench.eval_ece import collect_logits, split_rows
+
     rows = collect_logits(agent, dataset)
     fit_rows, report_rows, unfittable = split_rows(rows, seed=seed,
                                                    min_per_bucket=min_per_bucket)
