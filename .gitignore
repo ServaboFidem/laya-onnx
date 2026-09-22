@@ -55,3 +55,7 @@ graft/
 .claude/*
 !.claude/skills/
 
+
+# Subagent-driven-development scratch workspace (ledgers, briefs, review packages).
+# Ephemeral coordination state, not source.
+.superpowers/
