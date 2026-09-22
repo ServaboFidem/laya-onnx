@@ -1,8 +1,8 @@
 """Export DecisionModel to ONNX (fp32). One of only two places that may import torch.
 
-This module runs once, offline, on a machine that has PyTorch. The artifact it writes is what
-the runtime loads; nothing under `laya_onnx/` outside this package imports torch, so the serving
-host never needs it.
+This module runs once, offline, on a machine that has PyTorch, `onnx` and `onnxscript`
+installed. The artifact it writes is what the runtime loads; nothing under `laya_onnx/` outside
+this package imports torch, so the serving host needs none of those three.
 
 Three things about the traced graph are load-bearing, and each of them fails silently rather
 than loudly if you get it wrong - the export succeeds, the sample reproduces, and only a real
@@ -100,7 +100,24 @@ def export_fp32(model, out_path: str, opset: int = 17) -> str:
             },
             opset_version=opset,
             do_constant_folding=True,
-            dynamo=False,
+            # dynamo=True is not a preference, it is the only exporter that gets the sequence
+            # axis right here. The legacy TorchScript exporter traces `nn.MultiheadAttention`
+            # in the decision head through `F.multi_head_attention_forward`, whose
+            # `q.view(tgt_len, bsz * num_heads, head_dim)` (torch/nn/functional.py, the line
+            # reached on every path) reads `tgt_len` off a Python unpack of `query.shape`. The
+            # tracer freezes that into a Constant, so the exported graph carries the sample's
+            # sequence length inside the head's attention and dies on the first request of a
+            # different length:
+            #     Reshape ... Input shape:{48,3,64}, requested shape:{32,3,64}
+            # Only `bsz` survives as a Shape/Gather. `do_constant_folding=False` does not help
+            # - the constant is in the trace, not the folder. torch.export keeps all three
+            # axes symbolic instead. This requires `onnxscript` at export time (never at
+            # runtime); torch raises a clear ModuleNotFoundError if it is missing.
+            #
+            # verbose=False because the exporter's progress lines contain U+2705, which raises
+            # UnicodeEncodeError on a Windows console left at cp1252.
+            dynamo=True,
+            verbose=False,
         )
     return out_path
 
