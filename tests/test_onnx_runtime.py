@@ -192,6 +192,31 @@ try:
 finally:
     shutil.rmtree(tmp3, ignore_errors=True)
 
+
+# --- a config present but missing max_len/head_max_len must raise, not fall back -----------
+# This is the case the Important-1 review finding named directly: __init__ must never default
+# either value (e.g. toward 1024/256) when the key is simply absent from an otherwise-valid
+# config, because that "helpful" fallback is exactly what would silently build a 1024-token
+# sequence against a graph an english-checkpoint export traced for 512. No tokenizer or
+# model.onnx is needed for this check -- __init__ must raise before it ever gets to
+# TokenizerAdapter or OnnxSession, so none is written here.
+for missing_key, cfg in [
+    ("max_len", {"head_max_len": FIXTURE_HEAD_MAX_LEN}),
+    ("head_max_len", {"max_len": FIXTURE_MAX_LEN}),
+]:
+    tmp4 = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(tmp4, "rl_agent_config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        try:
+            OnnxAgent(tmp4)
+            check("config/missing-%s-raises" % missing_key, False)
+        except ValueError as e:
+            check("config/missing-%s-raises" % missing_key, True)
+            check("config/missing-%s-message-names-key" % missing_key, missing_key in str(e))
+    finally:
+        shutil.rmtree(tmp4, ignore_errors=True)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
     print("  FAIL", f)

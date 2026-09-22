@@ -10,11 +10,17 @@ merely asserted in a comment:
 
 1. `max_len`/`head_max_len` MUST come from the checkpoint's own `rl_agent_config.json`, never
    from `build_sequence`'s defaults (512/192, upstream's English-checkpoint numbers kept for
-   byte-parity). The multilingual checkpoint this port targets runs at 1024/256 -- a ~768-token
-   state budget instead of ~317 -- and that budget is the whole reason this port exists on top
-   of mmBERT rather than the English checkpoint. Reading `self.cfg.get("max_len", 1024)` with a
-   1024 fallback (not 512) means even a checkpoint whose config is missing the key fails toward
-   the multilingual number, not silently back toward upstream's English one.
+   byte-parity) and never from any other hardcoded fallback either. The multilingual checkpoint
+   this port targets runs at 1024/256 -- a ~768-token state budget instead of ~317 -- and that
+   budget is the whole reason this port exists on top of mmBERT rather than the English
+   checkpoint. A fallback that leans toward those multilingual numbers is *still* wrong: point
+   this loader at an english-checkpoint export (a 512-token graph) whose config happens to omit
+   `max_len`, and a 1024 fallback would silently build a sequence the traced graph was never
+   shaped for -- no error, just a wrong answer. So `__init__` requires both keys to be present
+   and raises `ValueError` naming whichever is missing, the same way it already raises
+   `FileNotFoundError` for a missing config file altogether; `system_one` reads
+   `self.max_len`/`self.head_max_len`, set once at load time, with no `.get(..., default)`
+   anywhere in the call path.
 
 2. A question with fewer than 2 options must be rejected before it reaches the graph. The graph
    was traced with 3 markers (laya_onnx/export/export_fp32.py's `markers = 3` sample) specifically
@@ -67,6 +73,25 @@ class OnnxAgent:
         with open(cfg_path, encoding="utf-8") as f:
             self.cfg = json.load(f)
 
+        # The token budget must come from THIS checkpoint's own config, never a hardcoded
+        # fallback. A fallback here is not conservative -- it is actively dangerous: point this
+        # at an english-checkpoint export (512-token graph) whose config happens to omit
+        # max_len, and a 1024-default would silently build a sequence the traced graph was
+        # never shaped for, producing a wrong answer with no error anywhere. So a config that is
+        # present but missing either key is exactly as incompatible as one that is absent
+        # entirely (see the FileNotFoundError above), and raises the same way.
+        missing = [k for k in ("max_len", "head_max_len") if k not in self.cfg]
+        if missing:
+            raise ValueError(
+                "Incompatible checkpoint: %r's rl_agent_config.json is missing %s. Both "
+                "max_len and head_max_len are required -- this runtime never assumes a token "
+                "budget, since the wrong one (e.g. falling back toward the English "
+                "checkpoint's 512/192 or vice versa) silently truncates the state without "
+                "any error." % (model_dir, ", ".join(sorted(missing)))
+            )
+        self.max_len = self.cfg["max_len"]
+        self.head_max_len = self.cfg["head_max_len"]
+
         self.tok = TokenizerAdapter(model_dir)
         self.session = OnnxSession(os.path.join(model_dir, "model.onnx"), threads=threads)
 
@@ -85,11 +110,11 @@ class OnnxAgent:
         addition -- the torch path never reports how much of a state it had to drop.
         """
         ids = list(questions.keys())
-        # Requirement 1 (see module docstring): read from the checkpoint's own config, and fail
-        # toward the multilingual budget (1024/256), never upstream's English default (512/192),
-        # if a key happens to be missing.
-        max_len = self.cfg.get("max_len", 1024)
-        head_max_len = self.cfg.get("head_max_len", 256)
+        # Requirement 1 (see module docstring): self.max_len/self.head_max_len were read from
+        # this checkpoint's own config in __init__, with no fallback -- a config missing either
+        # key already raised there, so there is nothing to default here.
+        max_len = self.max_len
+        head_max_len = self.head_max_len
 
         items, internal = [], {}
         for qid in ids:
