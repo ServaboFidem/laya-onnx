@@ -33,11 +33,14 @@ laya_onnx/      torch-free ONNX runtime for the multilingual checkpoint (see lay
   session.py     onnxruntime wrapper; numpy + onnxruntime only, never torch
   sequence.py    build_sequence, VENDORED from laya/common.py -- parity-tested, do not edit freely
   collate.py     the five arrays the graph declares; padding and marker positions
-  postprocess.py logits -> typed answers; temperature lookup and clamping
+  postprocess.py logits -> typed answers; its six laya.common helpers are VENDORED, parity-tested
   tokenizer.py   TokenizerAdapter over `tokenizers`, replacing transformers' AutoTokenizer
   truncation.py  truncation_report(): how much state was dropped, which torch never reports
   export/        the ONE subpackage that may import torch; fp32 export, int8, temperature refit
-  bench/         latency + ECE measurement; may import torch, never fetches data, never shipped
+  bench/         latency + ECE measurement; may import torch; never shipped in a wheel.
+                 Its *functions* never fetch data -- measure_ece/refit take the examples as an
+                 argument -- but eval_ece's `__main__` downloads five Hub suites. That is the
+                 rule bench/__init__.py states, and the one to preserve.
 tests/           plain scripts, not pytest (see Testing)
 docs/            architecture + router-flow diagrams, self-contained HTML (see Diagrams)
 research/        benchmark harnesses + raw result JSON; never imported by the package
@@ -106,6 +109,15 @@ nor transformers**. Spec: `docs/superpowers/specs/2026-09-21-laya-onnx-port.md`.
 `laya_onnx/README.md`, which is the evidence document for this package the way the root README is
 for `laya/`.
 
+**`laya_onnx` ships in no wheel.** `pyproject.toml` keeps `packages = ["laya"]`, deliberately, so
+a `pip install laya` gets the torch package and nothing else; `laya_onnx` is importable from a
+checkout, which is what the ONNX tests, the export CLIs and the benchmarks use. The consequence
+to hold in mind: `[project.optional-dependencies]` does publish `onnx` and `onnx-export` extras,
+so `pip install laya[onnx]` installs onnxruntime and tokenizers and hands the user no module
+that imports them. The extras are correct for a checkout and wrong for a release, and both
+files say so — shipping `laya_onnx` in the wheel is a separate decision that also changes what
+`tests/test_packaging.py` has to assert.
+
 **`laya/` is not to be edited by ONNX work.** That was a hard constraint of the port and it
 stays one. `laya` is the upstream package and the fork's value is that it remains a clean
 downstream of `NandhaKishorM/laya`; a refactor of `laya/common.py` "so the ONNX side can import
@@ -122,6 +134,24 @@ is behavioural equality, not a source-text diff, so a refactor upstream that pre
 passes. **If you edit `laya_onnx/sequence.py` for any reason other than tracking upstream, you
 have broken the thing the test is protecting.**
 
+`sequence.py` is not the only vendored file. `laya_onnx/postprocess.py` copies `QTYPES`,
+`QTYPE_NAMES`, `confidence_from_probs`, `temp_bucket`, `TEMP_MIN`/`TEMP_MAX` and
+`clamp_temperature` verbatim from `laya/common.py`, for the same reason and with the same
+hazard — a shifted bucket boundary or a changed entropy normalisation upstream would leave the
+two paths publishing different `confidence` values for identical logits. Those six are now
+parity-tested the same way, at the bottom of `tests/test_onnx_postprocess.py`: both
+implementations imported, `temp_bucket` compared over every `(qtype, k)` for k in 0..39,
+`confidence_from_probs` over a spread of simplex vectors for k in 1..19, and
+`clamp_temperature` over its boundaries and its pathological inputs. That file therefore
+imports torch, like the sequence suite; both run in the ONNX CI job, which has it.
+
+**Two pieces of vendored-shaped code are still covered only outside CI.** `_to_internal`
+(`laya_onnx/runtime.py:46-56`, copied from `laya/agent.py:255`) and the body of
+`build_answers`'s per-question loop (lifted from `laya/agent.py`'s torch path) have no
+upstream-parity assertion; what checks them against the real thing is
+`tests/test_onnx_local_e2e.py`, which needs real weights and is **not** in CI. Change either
+side and the divergence is caught by hand or not at all.
+
 **The no-torch constraint is enforced, not documented.** `tests/test_onnx_no_torch.py` clears
 `torch`, `transformers`, `laya` and `laya_onnx` out of `sys.modules`, imports `laya_onnx`, and
 asserts none of the first three came back — plus a second check that installs an import hook, so
@@ -134,7 +164,7 @@ re-export of either to `__init__.py` fails that test, which is the point.
 
 **Ship fp32.** The int8 build is reproducible and stays in the tree, but it is measurably worse
 where it matters: `noul:2` accuracy 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled p = 3.1e-05),
-while ECE does not clearly separate the two graphs. On the benchmark host it bought 4–23%
+while ECE does not clearly separate the three graphs. On the benchmark host it bought 4–23%
 latency and ~4x less disk. That is not a trade worth taking for a decision model whose output is
 a label. `laya_onnx/README.md` has the full study, including what was ruled out (the embedding
 table) and what was never tried (per-layer exclusion, static calibration, per-channel weights) —

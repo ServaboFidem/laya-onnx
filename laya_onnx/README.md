@@ -13,7 +13,7 @@ checked by anything.
 
 **Ship the fp32 export.** The int8 build is in the tree, is reproducible, and is measurably
 worse where it matters: `noul:2` accuracy falls 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled
-p = 3.1e-05), while ECE does not clearly separate the two graphs. The section below has the
+p = 3.1e-05), while ECE does not clearly separate the three graphs. The section below has the
 full study. The latency table below is the other half of that decision — on the machine
 measured here, int8 bought 4–23% and cost the labels.
 
@@ -109,6 +109,19 @@ thread count:
 | 10 | 1135.6 ms | 1201.2 ms | 1.06x (ONNX slower) |
 | 50 | 3689.5 ms | 6689.7 ms | **1.81x** (ONNX slower) |
 
+**Nothing in this tree reproduces the torch column, and nothing in CI reproduces either.**
+`bench_latency.py` measures the ONNX column only — by construction, not by omission: it refuses
+to let torch into the process at all (item 4 of `laya_onnx/bench/bench_latency.py`'s docstring,
+"Torch-free by construction", explains why a latency number for the ONNX path measured beside a
+resident torch is not the number a deployment gets), and its `main()` calls `laya_onnx.load`
+and nothing else. So the "Reproduce
+with:" block above regenerates the right-hand column; the torch p50s came from a separate
+off-tree run of the same state, the same questions and the same 5-warmup/50-run protocol on the
+same host, and no script in this repository re-derives them. Read them as a recorded
+measurement with a stated method, not as a checked-in one — the same standing as the 3.719e-05
+parity figure at the top of this file. If this comparison has to be re-run, the honest way is
+two processes, not one.
+
 **The ONNX port is not a speed win on this host, and above one question per call it is a
 loss.** That is worth saying plainly, because "export to ONNX" is usually pitched as an
 optimization. The reason to take this port is the one in the package docstring: a serving
@@ -153,9 +166,10 @@ section is why it is not worth taking.
 export. It works, and it is up to 3.97x smaller. **Ship fp32 anyway.** The reason is in the
 tables below, and it is not the one you would expect: **the accuracy is what breaks.** Paired
 McNemar puts the `noul:2` accuracy loss at p = 1.6e-06 and the pooled loss over 750 held-out
-rows at p = 3.1e-05. ECE, meanwhile, does not distinguish the graphs at this sample size at
-all — so the failure is in the labels, not in the calibration that a temperature refit could
-repair.
+rows at p = 3.1e-05. ECE, meanwhile, does not distinguish the three graphs at this sample
+size — with one nominal exception, `choice:3-5` on int8-body at permutation p = 0.030, which is
+recorded and weighed below rather than smoothed away. So the failure is in the labels, not in
+the calibration that a temperature refit could repair.
 
 Two int8 configurations were measured, not one, on the same data and the same held-out split:
 
@@ -164,6 +178,9 @@ Two int8 configurations were measured, not one, on the same data and the same he
 | `fp32` | — | 1290.5 MB (2.9 MB graph + 1287.7 MB `.onnx.data`) | 0 | 0 |
 | `int8-all` | `True` (stock `quantize_dynamic`) | 324.7 MB | 102 | 100 |
 | `int8-body` | `False` (**default**) | 914.6 MB | 100 | 100 |
+
+Each size above is rounded on its own, which is why the fp32 row's two parts read as 1290.6
+against a 1290.5 total. Neither figure was adjusted to make the addition come out.
 
 The only difference between the two int8 graphs is the [256000, 768] token-embedding table,
 which holds ~196M of the checkpoint's ~322M parameters. Stock `quantize_dynamic` quantizes it
@@ -338,13 +355,26 @@ directionally consistent but individually within noise, and the recommendation r
 Every interval, p-value and floor above is emitted by the driver itself:
 
 ```bash
-python -m laya_onnx.bench.eval_ece --rows-in rows.npz --rows-keys fp32,int8_body
+python -m laya_onnx.bench.eval_ece <fp32_dir> <int8_dir> --n 300 --rows-out rows.npz --out study.json
+python -m laya_onnx.bench.eval_ece --rows-in rows.npz --rows-keys fp32,int8   # no weights needed
 ```
 
-`--rows-in` reads the cached logits that `--rows-out` writes, so the whole statistical section
-re-derives **without the 1.3 GB checkpoint** — the underlying functions are `bootstrap_ci`,
-`paired_ece_gap`, `paired_mcnemar`, `accuracy_of` and `ece_of` in `laya_onnx.bench.eval_ece`,
-all unit-tested in `tests/test_onnx_calibration.py`.
+`--rows-in` reads the cached logits that `--rows-out` writes — under the array names `fp32` and
+`int8`, which is what the second command passes and which is also the default, so `--rows-keys`
+can be dropped. (An earlier revision of this file documented `fp32,int8_body`; no run of
+`--rows-out` has ever written that name, and the command as printed would have failed with a
+`KeyError`. The int8 *configuration* being compared is chosen by which export directory the
+first command is pointed at, not by the cache key.)
+
+**And the second command needs a cache this repository does not contain.** No `rows.npz` is
+committed — it is tens of megabytes of logits — so "re-derives without the 1.3 GB checkpoint"
+means: once someone has run the first command, every interval, p-value and floor above can be
+recomputed, by them or by anyone they hand the file to, on a machine with no weights. It is not
+a path from a fresh clone to these numbers. Nothing in CI runs either command. What CI does
+check is the statistics themselves: `bootstrap_ci`, `paired_ece_gap`, `paired_mcnemar`,
+`accuracy_of` and `ece_of` in `laya_onnx.bench.eval_ece` are unit-tested against hand-computable
+cases in `tests/test_onnx_calibration.py`, which also drives `main()` end to end over a
+synthetic cache.
 
 ### How faithful is the int8 graph, really?
 

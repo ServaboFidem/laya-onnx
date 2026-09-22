@@ -33,6 +33,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# READ THIS FIRST: both extras below install dependencies for a package the wheel does not
+# contain. `packages = ["laya"]` (see [tool.setuptools]) is deliberate, so after a release
+# `pip install laya[onnx]` pulls onnxruntime and tokenizers and ships the user no module that
+# imports them -- `laya_onnx` is importable from a checkout only. The extras are kept because
+# they are the accurate, version-floored description of what that checkout needs, and because
+# a release that ever does include `laya_onnx` must not also have to rediscover these floors.
+# They are not yet a supported install path. If `laya_onnx` is added to `packages`, that is the
+# commit where this comment comes out -- and tests/test_packaging.py's assertions about these
+# extras change with it.
+#
 # The ONNX *serving* path (`laya_onnx.load`, `OnnxAgent.predict`). Deliberately excludes torch,
 # transformers and `onnx` itself: the whole point of laya_onnx is a process that holds none of
 # them, and tests/test_onnx_no_torch.py fails the build if one creeps back in. numpy is already a
