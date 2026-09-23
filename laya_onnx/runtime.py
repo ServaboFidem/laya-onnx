@@ -1,9 +1,9 @@
 """OnnxAgent: the torch-free equivalent of laya.Agent, for the multilingual (mmBERT) checkpoint.
 
 This module is the seam where Tasks 1-6 become one callable pipeline: TokenizerAdapter ->
-build_sequence -> collate -> OnnxSession -> build_answers, wrapped the same way laya.agent.Agent
-wraps the torch path (laya/agent.py:266-370), so `OnnxAgent.system_one` returns the same shaped
-answer dict for the same inputs.
+build_sequence -> collate -> OnnxSession (or OpenVinoSession) -> build_answers, wrapped the same
+way laya.agent.Agent wraps the torch path (laya/agent.py:266-370), so `OnnxAgent.system_one`
+returns the same shaped answer dict for the same inputs.
 
 Two things bind this module and are each covered by tests/test_onnx_runtime.py rather than
 merely asserted in a comment:
@@ -38,7 +38,6 @@ from typing import Any, Dict, Optional, Union
 from .collate import collate
 from .postprocess import QTYPES, build_answers
 from .sequence import build_sequence, render_options
-from .session import OnnxSession
 from .tokenizer import TokenizerAdapter
 from .truncation import truncation_report
 
@@ -56,12 +55,38 @@ def _to_internal(qdef: Dict) -> Dict:
     return {"t": t, "ins": ins, "crit": crit}
 
 
+BACKENDS = ("onnxruntime", "openvino")
+
+
+def _make_session(backend: str, model_path: str, threads: Optional[int]):
+    """Build the session for `backend`, importing only that backend's runtime.
+
+    The imports are deliberately here and not at module scope: a process that serves through
+    OpenVINO need not have onnxruntime installed, and vice versa. Both session classes share one
+    contract -- `run(batch) -> (logits, act_logits)` -- so nothing downstream knows which ran.
+    """
+    if backend == "onnxruntime":
+        from .session import OnnxSession
+        return OnnxSession(model_path, threads=threads)
+    if backend == "openvino":
+        from .session_openvino import OpenVinoSession
+        return OpenVinoSession(model_path, threads=threads)
+    raise ValueError("unknown backend %r; expected one of %s" % (backend, ", ".join(BACKENDS)))
+
+
 class OnnxAgent:
     """Loads a laya-onnx checkpoint directory (model.onnx + rl_agent_config.json + tokenizer/)
     and answers typed questions against it without torch or transformers in the process.
+
+    `backend` picks the runtime that executes the exported graph: "onnxruntime" (the default)
+    or "openvino". Same export, same inputs, same postprocessing; see
+    docs/superpowers/specs/2026-09-23-openvino-backend.md for why the default is unchanged.
     """
 
-    def __init__(self, model_dir: str, threads: Optional[int] = None):
+    def __init__(self, model_dir: str, threads: Optional[int] = None, backend: str = "onnxruntime"):
+        # Checked before any file is read, so a typo fails on the argument, not on a side effect.
+        if backend not in BACKENDS:
+            raise ValueError("unknown backend %r; expected one of %s" % (backend, ", ".join(BACKENDS)))
         cfg_path = os.path.join(model_dir, "rl_agent_config.json")
         if not os.path.exists(cfg_path):
             raise FileNotFoundError(
@@ -93,7 +118,8 @@ class OnnxAgent:
         self.head_max_len = self.cfg["head_max_len"]
 
         self.tok = TokenizerAdapter(model_dir)
-        self.session = OnnxSession(os.path.join(model_dir, "model.onnx"), threads=threads)
+        self.backend = backend
+        self.session = _make_session(backend, os.path.join(model_dir, "model.onnx"), threads)
 
         # `laya-multilingual` ships no fitted temperatures at all -- these defaults (identity
         # scaling) are the normal path for that checkpoint, not a fallback for a broken one.
@@ -157,8 +183,8 @@ class OnnxAgent:
     predict = system_one
 
 
-def load(model_dir: str, threads: Optional[int] = None) -> OnnxAgent:
+def load(model_dir: str, threads: Optional[int] = None, backend: str = "onnxruntime") -> OnnxAgent:
     """Load a laya-onnx checkpoint directory. Mirrors laya.agent.load's shape but takes a local
     path only -- there is no Hub download path here; that is out of scope for this module
-    (checkpoint acquisition is Task 8's job)."""
-    return OnnxAgent(model_dir, threads=threads)
+    (checkpoint acquisition is Task 8's job). `backend` is "onnxruntime" or "openvino"."""
+    return OnnxAgent(model_dir, threads=threads, backend=backend)

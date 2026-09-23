@@ -141,6 +141,8 @@ try:
     import laya_onnx.postprocess                   # noqa: E402, F401
     import laya_onnx.sequence                      # noqa: E402, F401
     import laya_onnx.session                       # noqa: E402, F401
+    import laya_onnx.external_data                 # noqa: E402, F401
+    import laya_onnx.session_openvino              # noqa: E402, F401
     import laya_onnx.tokenizer                     # noqa: E402, F401
     import laya_onnx.truncation                    # noqa: E402, F401
     check("import/survives-torch-blocked", True)

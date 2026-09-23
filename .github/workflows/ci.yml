@@ -53,7 +53,7 @@ jobs:
       - name: Email cleaning tests
         run: python tests/test_email.py
 
-      # The eight offline ONNX suites. tests/test_onnx_local_e2e.py is NOT here on purpose: it
+      # The nine offline ONNX suites. tests/test_onnx_local_e2e.py is NOT here on purpose: it
       # needs the real multilingual weights plus a ~1.3 GB export on disk, exactly like
       # tests/test_local_e2e.py, and is run by hand when the forward path changes.
       #
@@ -63,13 +63,14 @@ jobs:
       # transformers arrive with `pip install -e .` above.
       - name: ONNX runtime tests
         run: |
-          pip install onnx onnxruntime tokenizers
+          pip install onnx onnxruntime openvino tokenizers
           python tests/test_onnx_sequence.py
           python tests/test_onnx_truncation.py
           python tests/test_onnx_tokenizer.py
           python tests/test_onnx_postprocess.py
           python tests/test_onnx_export.py
           python tests/test_onnx_runtime.py
+          python tests/test_onnx_openvino.py
           python tests/test_onnx_calibration.py
           python tests/test_onnx_no_torch.py
 

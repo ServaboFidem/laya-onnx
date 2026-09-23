@@ -48,18 +48,19 @@ jobs:
           python tests/test_decision_model.py
           python tests/test_packaging.py
 
-      # The eight offline ONNX suites, the same set ci.yml runs. Both workflows must carry every
+      # The nine offline ONNX suites, the same set ci.yml runs. Both workflows must carry every
       # suite: a test wired into only one of them silently stops guarding a release.
       # tests/test_onnx_local_e2e.py stays out here too -- it needs real weights on disk.
       - name: ONNX tests must pass before anything is published
         run: |
-          pip install onnx onnxruntime tokenizers
+          pip install onnx onnxruntime openvino tokenizers
           python tests/test_onnx_sequence.py
           python tests/test_onnx_truncation.py
           python tests/test_onnx_tokenizer.py
           python tests/test_onnx_postprocess.py
           python tests/test_onnx_export.py
           python tests/test_onnx_runtime.py
+          python tests/test_onnx_openvino.py
           python tests/test_onnx_calibration.py
           python tests/test_onnx_no_torch.py
 

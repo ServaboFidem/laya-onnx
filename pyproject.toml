@@ -48,7 +48,7 @@ dependencies = [
 # them, and tests/test_onnx_no_torch.py fails the build if one creeps back in. numpy is already a
 # core dependency and is repeated here only so this extra reads as a complete description of what
 # the runtime needs. The onnxruntime floor is a measured one, not a minimum: 1.30.0 is the
-# release the eight offline ONNX suites and the shipped export's latency were last run on
+# release the offline ONNX suites and the shipped export's latency were last run on
 # (laya_onnx/README.md records both environments it has been measured in). Older releases are
 # untested here rather than known to fail. The tokenizers and numpy floors are still the port
 # plan's; what *is* measured is that the shipped export runs on tokenizers 0.22.2 and
@@ -65,6 +65,17 @@ onnx = [
 # implemented on top of onnxscript. These floors are the versions the shipped fp32 export was
 # actually produced and verified with -- known-good, not a measured minimum; older releases are
 # untested here rather than known to fail.
+# The same serving path on OpenVINO instead (`laya_onnx.load(dir, backend="openvino")`). Same
+# checkout-only caveat as `onnx` above, and deliberately without onnxruntime: runtime.py imports
+# only the selected backend, so a process serving through OpenVINO needs no second runtime
+# (tests/test_onnx_openvino.py checks that in a subprocess). The floor is the release the
+# backend's tests and laya_onnx/README.md's OpenVINO latency figures were run on, not a known
+# minimum.
+onnx-openvino = [
+    "openvino>=2026.4",
+    "tokenizers>=0.15",
+    "numpy>=1.20.0",
+]
 onnx-export = [
     "onnx>=1.23",
     "onnxscript>=0.7",
