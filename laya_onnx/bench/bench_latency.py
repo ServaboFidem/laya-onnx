@@ -177,15 +177,19 @@ def main(argv=None) -> int:
                     help="onnxruntime intra_op_num_threads; default leaves ORT's own default, "
                          "which is every physical core and is usually wrong on a shared host")
     ap.add_argument("--counts", default="1,5,10,50", help="comma-separated questions-per-call (default 1,5,10,50)")
+    ap.add_argument("--backend", default="onnxruntime", choices=("onnxruntime", "openvino"),
+                    help="runtime that executes the export (default onnxruntime); --threads maps to "
+                         "OpenVINO's INFERENCE_NUM_THREADS under openvino")
     args = ap.parse_args(argv)
 
     from laya_onnx import load  # imported here so --help works without onnxruntime installed
 
-    agent = load(os.path.expanduser(args.model_dir), threads=args.threads)
+    agent = load(os.path.expanduser(args.model_dir), threads=args.threads, backend=args.backend)
     counts = [int(c) for c in args.counts.split(",") if c.strip()]
 
     print("model_dir : %s" % os.path.expanduser(args.model_dir))
-    print("threads   : %s" % ("ORT default" if args.threads is None else args.threads))
+    print("backend   : %s" % args.backend)
+    print("threads   : %s" % ("runtime default" if args.threads is None else args.threads))
     print("budget    : max_len=%d head_max_len=%d" % (agent.max_len, agent.head_max_len))
     print()
     print("%10s %10s %10s %10s %10s" % ("questions", "p50 ms", "p95 ms", "min ms", "max ms"))

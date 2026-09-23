@@ -11,6 +11,13 @@ export on disk, so it is **not in CI and nothing in CI reproduces this number** 
 hand. If you change the forward path and do not run it, the figure above has stopped being
 checked by anything.
 
+**Two runtimes, one export.** `laya_onnx.load(dir, backend="openvino")` runs the same
+`model.onnx` on OpenVINO's CPU plugin instead of onnxruntime, with fp32 pinned. The same 318
+real-weights checks pass against it (max |delta| **4.005e-05**, `LAYA_ONNX_BACKEND=openvino
+python tests/test_onnx_local_e2e.py`), and it is the faster of the two on the host measured here
+— see [OpenVINO backend](#openvino-backend) under Latency. The default is still onnxruntime; the
+spec (`docs/superpowers/specs/2026-09-23-openvino-backend.md`) says why.
+
 **Ship the fp32 export.** The int8 build is in the tree, is reproducible, and is measurably
 worse where it matters: `noul:2` accuracy falls 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled
 p = 3.1e-05), while ECE does not clearly separate the three graphs. The section below has the
@@ -202,6 +209,61 @@ identically to four decimals at 0.3–2.0% lower p50 at 4 threads, inside run-to
 the fp32 headroom is real but not a switch: fusing this model's attention means custom pattern
 work against this specific capture (rotary on q and k, a 128-token sliding-window mask on every
 layer but each third), and nothing in this tree has attempted it.
+
+### OpenVINO backend
+
+The same shipped fp32 export, loaded unmodified by each runtime, measured with
+`bench_latency --backend onnxruntime|openvino`, 3 warmup / 20 timed runs, nearest-rank p50, one
+process per row. Same host as every table above; Python 3.13.9, onnxruntime 1.30.0, OpenVINO
+2026.4.0, numpy 2.5.3, tokenizers 0.22.2.
+
+| threads | questions per call | onnxruntime p50 | OpenVINO p50 | ORT / OpenVINO |
+|---|---|---|---|---|
+| default | 1 | 152.4 ms | 73.9 ms | **2.06x** |
+| default | 5 | 671.5 ms | 255.6 ms | **2.63x** |
+| default | 10 | 1262.1 ms | 486.3 ms | **2.60x** |
+| default | 50 | 6749.2 ms | 2378.9 ms | **2.84x** |
+| 4 | 1 | 217.7 ms | 207.9 ms | 1.05x |
+| 4 | 5 | 1125.8 ms | 951.7 ms | 1.18x |
+| 4 | 10 | 2332.4 ms | 1791.8 ms | 1.30x |
+| 4 | 50 | 13167.6 ms | 9028.5 ms | 1.46x |
+
+**Read the two halves separately, because they answer different questions.**
+
+- *At each runtime's default* OpenVINO is 2.1–2.8x faster. Part of that is not kernels but
+  thread placement: OpenVINO's latency hint sizes its pool to one socket's physical cores
+  (`OpenVinoSession.threads` reports 20 here) and keeps it there, where onnxruntime's default pool
+  is the one this README already shows paying for the second socket. On this host that is a real
+  and repeatable win, but it is a property of a two-socket box, not of the graph.
+- *At an equal 4 threads* — the commodity-container proxy used above — the gap is 1.05x at one
+  question, inside run-to-run spread, growing to 1.46x at 50. That growth is the kernel and fusion
+  difference showing through as batches get larger; a single question on four cores gains nothing
+  worth claiming.
+
+So on a many-core host, `backend="openvino"` roughly halves latency or better; on a small quota,
+expect parity at one question and a moderate gain on batched calls. Neither half measures a
+laptop or a Linux box.
+
+Arithmetic is not what changed. The real-weights e2e suite passes 318/318 under OpenVINO, with
+max |delta| on raw logits against torch of **4.005e-05** (onnxruntime: 3.719e-05) and identical act
+probabilities; `tests/test_onnx_openvino.py` holds the two backends within 1e-4 of each other on
+the offline fixture at shapes the trace never saw, in CI. OpenVINO's inference precision is
+pinned to f32 and read back after compile: on a CPU with AMX or AVX512_BF16 its plugin would
+otherwise choose bf16 by itself, which would be a different model from the one every number in
+this file describes.
+
+**The second socket is still idle.** Windows shows a process one processor group — 40 of this
+host's 80 logical CPUs — and OpenVINO's threads stayed on socket 0 even when the process was
+started on node 1; its multi-stream and `TENSOR_PARALLEL` modes gained 0–26% in exploratory runs
+(`docs/superpowers/specs/2026-09-23-openvino-backend.md`). Using both sockets means one worker
+process per socket, or Linux; neither is measured here.
+
+Reproduce:
+
+```bash
+python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual --backend openvino --runs 20 --warmup 3
+python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual --backend openvino --threads 4 --runs 20 --warmup 3
+```
 
 ### int8, for completeness — still not recommended
 

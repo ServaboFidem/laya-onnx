@@ -31,6 +31,8 @@ laya/            the package (7 modules, ~1.9k lines total)
 laya_onnx/      torch-free ONNX runtime for the multilingual checkpoint (see laya_onnx)
   runtime.py     OnnxAgent: the no-torch mirror of laya.Agent; predict = system_one
   session.py     onnxruntime wrapper; numpy + onnxruntime only, never torch
+  session_openvino.py  the same contract on OpenVINO's CPU plugin; numpy + openvino only
+  external_data.py     the two-file (graph + .data) check both sessions run before loading
   sequence.py    build_sequence, VENDORED from laya/common.py -- parity-tested, do not edit freely
   collate.py     the five arrays the graph declares; padding and marker positions
   postprocess.py logits -> typed answers; its six laya.common helpers are VENDORED, parity-tested
@@ -173,10 +175,12 @@ those are labelled hypotheses there and should stay labelled.
 **An export is two files.** `export_fp32` writes `model.onnx` (~2.8 MB of graph) *and*
 `model.onnx.data` (~1.29 GB of initializers); the weights exceed protobuf's message ceiling, so
 external data is not optional. Copying only `model.onnx` deploys a model that cannot run. The
-exporter verifies the pairing at write time, and `OnnxSession.__init__` verifies it at load time:
-`declared_external_data` walks the graph's initializers with a hand-rolled protobuf reader (the
-runtime does not ship `onnx`) and raises `FileNotFoundError` naming the missing sidecar, before
-onnxruntime can report it as an opaque external-data error. The walker reads the whole graph
+exporter verifies the pairing at write time, and both sessions verify it at load time through
+`external_data.require_external_data`: `declared_external_data` walks the graph's initializers with
+a hand-rolled protobuf reader (the runtime does not ship `onnx`) and raises `FileNotFoundError`
+naming the missing sidecar, before onnxruntime or OpenVINO can report it as an opaque read error.
+It lives in its own module so the OpenVINO session can run it without importing onnxruntime;
+`laya_onnx.session` still re-exports `declared_external_data` for existing imports. The walker reads the whole graph
 file — free on fp32 (2.8 MB), 325–915 MB on the single-file int8 builds. Known rough edge — if
 you improve one thing here, improve that.
 
@@ -203,6 +207,18 @@ runs. `laya_onnx/README.md` carries the full tables with the machine block, plus
 (MatMul 56% of kernel time at 4 threads) and the finding that onnxruntime's transformer
 optimizer fuses only GELU on this capture. Any new latency claim gets the same scoping these do.
 
+**The OpenVINO backend** (`backend="openvino"`, `session_openvino.py`) runs the same export and
+is the faster runtime on this host: 2.06–2.84x at each runtime's default threads, 1.05–1.46x
+with both at 4 threads (1–50 questions; 3 warmup / 20 timed). The default-thread gap is partly
+OpenVINO keeping its pool on one socket, so do not quote it without the 4-thread row. It pins
+`INFERENCE_PRECISION_HINT=f32` and refuses to serve if the plugin reports otherwise — on AMX /
+AVX512_BF16 hardware the plugin would pick bf16 on its own. It keeps one `InferRequest` per
+thread because a shared one raises `Infer Request is busy` under concurrent `predict` calls
+(verified by mutation). `runtime.py` imports only the selected backend, so an OpenVINO-only
+process needs no onnxruntime; `tests/test_onnx_openvino.py` asserts that in a subprocess. The
+default backend stays onnxruntime until someone decides otherwise — see the spec,
+`docs/superpowers/specs/2026-09-23-openvino-backend.md`.
+
 ## Testing
 
 Tests are **standalone scripts, not pytest**. Each collects `PASS`/`FAIL` lists, prints a
@@ -223,13 +239,14 @@ python tests/test_onnx_tokenizer.py     # TokenizerAdapter vs. transformers' beh
 python tests/test_onnx_postprocess.py   # logits -> answers, temperature clamping
 python tests/test_onnx_export.py        # export guards by inspection (no weights needed)
 python tests/test_onnx_runtime.py       # OnnxAgent: config-required budget, k<2 rejection
+python tests/test_onnx_openvino.py      # OpenVINO backend: parity with ORT, f32 pinned, threads
 python tests/test_onnx_calibration.py   # int8 study: binning, McNemar, rail_status
 python tests/test_onnx_no_torch.py      # `import laya_onnx` must not pull torch in
 ```
 
-All fifteen run offline and are wired into both `ci.yml` and `release.yml` — **a new test file
-must be added to both workflows**, or it never runs. The eight ONNX suites sit in one step in
-each workflow, prefixed by `pip install onnx onnxruntime tokenizers`; torch and transformers
+All sixteen run offline and are wired into both `ci.yml` and `release.yml` — **a new test file
+must be added to both workflows**, or it never runs. The nine ONNX suites sit in one step in
+each workflow, prefixed by `pip install onnx onnxruntime openvino tokenizers`; torch and transformers
 arrive with `pip install -e .`, and `onnxscript` is deliberately absent because no offline test
 runs the dynamo exporter.
 
@@ -241,7 +258,8 @@ the forward path:
 - `tests/test_onnx_local_e2e.py` — the ONNX path against torch on the same weights. This is the
   test behind the **3.719e-05** max-|delta| parity figure in `laya_onnx/README.md`; nothing in
   CI reproduces that number, so changing the forward path without running this file means the
-  claim is no longer being checked by anything.
+  claim is no longer being checked by anything. `LAYA_ONNX_BACKEND=openvino` runs the same
+  318 checks against the OpenVINO backend (max |delta| 4.005e-05 when last run).
 
 **Known pre-existing failure on Windows.** `tests/test_download.py` fails 5 cases locally:
 `tests/test_download.py:52` builds expected paths with `str(p.relative_to(...))` (backslashes on
