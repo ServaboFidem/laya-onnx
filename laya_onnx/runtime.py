@@ -69,7 +69,15 @@ def _make_session(backend: str, model_path: str, threads: Optional[int]):
         from .session import OnnxSession
         return OnnxSession(model_path, threads=threads)
     if backend == "openvino":
-        from .session_openvino import OpenVinoSession
+        try:
+            from .session_openvino import OpenVinoSession
+        except ImportError as e:
+            # openvino is the default, so this is the first thing a user with only the old
+            # onnxruntime install will hit; say what to do instead of surfacing a bare import error.
+            raise ImportError(
+                "laya_onnx's default backend is 'openvino', which needs the openvino package "
+                "(pip install openvino). Install it, or pass backend='onnxruntime' to use "
+                "onnxruntime instead. (%s)" % e) from e
         return OpenVinoSession(model_path, threads=threads)
     raise ValueError("unknown backend %r; expected one of %s" % (backend, ", ".join(BACKENDS)))
 
@@ -78,12 +86,13 @@ class OnnxAgent:
     """Loads a laya-onnx checkpoint directory (model.onnx + rl_agent_config.json + tokenizer/)
     and answers typed questions against it without torch or transformers in the process.
 
-    `backend` picks the runtime that executes the exported graph: "onnxruntime" (the default)
-    or "openvino". Same export, same inputs, same postprocessing; see
-    docs/superpowers/specs/2026-09-23-openvino-backend.md for why the default is unchanged.
+    `backend` picks the runtime that executes the exported graph: "openvino" (the default) or
+    "onnxruntime". Same export, same inputs, same postprocessing. OpenVINO is the default because
+    it was the faster runtime on every measured configuration at the same fp32 arithmetic (318/318
+    real-weights parity checks; see laya_onnx/README.md, "OpenVINO backend").
     """
 
-    def __init__(self, model_dir: str, threads: Optional[int] = None, backend: str = "onnxruntime"):
+    def __init__(self, model_dir: str, threads: Optional[int] = None, backend: str = "openvino"):
         # Checked before any file is read, so a typo fails on the argument, not on a side effect.
         if backend not in BACKENDS:
             raise ValueError("unknown backend %r; expected one of %s" % (backend, ", ".join(BACKENDS)))
@@ -183,8 +192,8 @@ class OnnxAgent:
     predict = system_one
 
 
-def load(model_dir: str, threads: Optional[int] = None, backend: str = "onnxruntime") -> OnnxAgent:
+def load(model_dir: str, threads: Optional[int] = None, backend: str = "openvino") -> OnnxAgent:
     """Load a laya-onnx checkpoint directory. Mirrors laya.agent.load's shape but takes a local
     path only -- there is no Hub download path here; that is out of scope for this module
-    (checkpoint acquisition is Task 8's job). `backend` is "onnxruntime" or "openvino"."""
+    (checkpoint acquisition is Task 8's job). `backend` is "openvino" (default) or "onnxruntime"."""
     return OnnxAgent(model_dir, threads=threads, backend=backend)

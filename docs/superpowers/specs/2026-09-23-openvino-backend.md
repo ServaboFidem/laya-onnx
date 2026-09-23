@@ -62,9 +62,14 @@ arithmetic (Δlogit at fp32 reordering scale, top-1 agreement 100%).
 7. **The default stays `onnxruntime`.** Flipping it is a one-line change, but a separate
    decision: it changes what every existing caller runs, and it should follow a recorded
    real-weights parity run under OpenVINO rather than be bundled with the code that makes one
-   possible.
+   possible. *Superseded 2026-09-23:* after the real-weights run passed 318/318 under OpenVINO
+   (max |delta| 4.005e-05) and bench_latency showed it faster at every measured configuration,
+   the default was changed to `openvino` as its own commit. `backend="onnxruntime"` stays
+   supported, and the `onnx` extra now installs openvino; onnxruntime moved to `onnx-onnxruntime`.
 8. **A new `onnx-openvino` extra** (`openvino`, `tokenizers`, `numpy`), carrying the same
-   "checkout-only, not in the wheel" caveat as the `onnx` extra above it.
+   "checkout-only, not in the wheel" caveat as the `onnx` extra above it. *Superseded with the
+   default flip (item 7):* `onnx` itself is now the OpenVINO serving extra, and onnxruntime's is
+   `onnx-onnxruntime`.
 
 ## Tests
 

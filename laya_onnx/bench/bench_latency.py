@@ -37,7 +37,8 @@ questions are literals in this file, so the script runs offline against a local 
 
 Run it:
 
-    python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual
+    python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual            # openvino, the default
+    python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual --backend onnxruntime
     python -m laya_onnx.bench.bench_latency <dir> --runs 100 --threads 8 --counts 1,5,10,50
 """
 import argparse
@@ -174,11 +175,11 @@ def main(argv=None) -> int:
     ap.add_argument("--runs", type=int, default=50, help="timed runs per question count (default 50)")
     ap.add_argument("--warmup", type=int, default=5, help="discarded runs per question count (default 5)")
     ap.add_argument("--threads", type=int, default=None,
-                    help="onnxruntime intra_op_num_threads; default leaves ORT's own default, "
+                    help="intra-op thread count (ORT intra_op_num_threads / OpenVINO INFERENCE_NUM_THREADS); default leaves the runtime's own, "
                          "which is every physical core and is usually wrong on a shared host")
     ap.add_argument("--counts", default="1,5,10,50", help="comma-separated questions-per-call (default 1,5,10,50)")
-    ap.add_argument("--backend", default="onnxruntime", choices=("onnxruntime", "openvino"),
-                    help="runtime that executes the export (default onnxruntime); --threads maps to "
+    ap.add_argument("--backend", default="openvino", choices=("openvino", "onnxruntime"),
+                    help="runtime that executes the export (default openvino, laya_onnx's default); --threads maps to "
                          "OpenVINO's INFERENCE_NUM_THREADS under openvino")
     args = ap.parse_args(argv)
 

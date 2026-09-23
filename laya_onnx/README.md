@@ -2,8 +2,8 @@
 
 A torch-free ONNX runtime for laya's `multilingual` checkpoint (mmBERT-base, 322M, 1024/256
 token budget). `laya_onnx.load(dir)` returns an `OnnxAgent` whose `predict` / `system_one`
-return the same answer dicts as `laya.Agent`, from a process that has onnxruntime and numpy and
-neither torch nor transformers.
+return the same answer dicts as `laya.Agent`, from a process that has one runtime (OpenVINO by
+default, or onnxruntime) and numpy, and neither torch nor transformers.
 
 The fp32 export is verified against the torch path on real weights: max |delta| on the logits is
 **3.719e-05** (`tests/test_onnx_local_e2e.py`). That test needs the real weights plus a ~1.3 GB
@@ -11,12 +11,12 @@ export on disk, so it is **not in CI and nothing in CI reproduces this number** 
 hand. If you change the forward path and do not run it, the figure above has stopped being
 checked by anything.
 
-**Two runtimes, one export.** `laya_onnx.load(dir, backend="openvino")` runs the same
-`model.onnx` on OpenVINO's CPU plugin instead of onnxruntime, with fp32 pinned. The same 318
-real-weights checks pass against it (max |delta| **4.005e-05**, `LAYA_ONNX_BACKEND=openvino
-python tests/test_onnx_local_e2e.py`), and it is the faster of the two on the host measured here
-— see [OpenVINO backend](#openvino-backend) under Latency. The default is still onnxruntime; the
-spec (`docs/superpowers/specs/2026-09-23-openvino-backend.md`) says why.
+**Two runtimes, one export; OpenVINO is the default.** `laya_onnx.load(dir)` runs `model.onnx`
+on OpenVINO's CPU plugin with fp32 pinned; `laya_onnx.load(dir, backend="onnxruntime")` runs the
+same file on onnxruntime. The same 318 real-weights checks pass on both (max |delta| **4.005e-05**
+on OpenVINO, **3.719e-05** on onnxruntime), and OpenVINO is the faster of the two on every
+configuration measured here — see [OpenVINO backend](#openvino-backend) under Latency. Every
+latency table *above* that section was taken on onnxruntime, before the default changed.
 
 **Ship the fp32 export.** The int8 build is in the tree, is reproducible, and is measurably
 worse where it matters: `noul:2` accuracy falls 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled
@@ -56,7 +56,9 @@ module docstring for why a 1024 default would be actively dangerous against a 51
 ## Latency
 
 One `system_one` call answers N typed questions about one state in one forward pass, so the
-curve worth knowing is latency vs. questions per call. `laya_onnx/bench/bench_latency.py`
+curve worth knowing is latency vs. questions per call. Every table in this section down to
+"OpenVINO backend" is onnxruntime (`--backend onnxruntime`), taken before OpenVINO became the
+default. `laya_onnx/bench/bench_latency.py`
 measures it: 5 discarded warmup runs, then 50 timed runs, reported as nearest-rank p50 and p95
 so every figure is a latency that was actually observed.
 
@@ -77,7 +79,7 @@ cheap insurance here, not a large correction.
 Reproduce with:
 
 ```bash
-python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual --runs 50 --warmup 5
+python -m laya_onnx.bench.bench_latency ~/laya_onnx_models/multilingual --backend onnxruntime --runs 50 --warmup 5
 ```
 
 **Measured on one machine, and these numbers do not generalize.** Dual Intel Xeon Gold 6148
@@ -179,7 +181,7 @@ especially under a process pool, where leaving it unset gives every worker a ful
 
 #### Four threads, both libraries
 
-The commodity case, as close as this host can get to it: `bench_latency --threads 4` and
+The commodity case, as close as this host can get to it: `bench_latency --backend onnxruntime --threads 4` and
 `bench_torch --threads 4`, same state, same questions, two processes, **3 warmup and 20 timed
 runs** rather than the 5/50 of the tables above — read these to two significant figures too.
 Four threads of a Xeon Gold 6148 (AVX-512, 2.4 GHz) is a proxy for a small CPU-quota'd

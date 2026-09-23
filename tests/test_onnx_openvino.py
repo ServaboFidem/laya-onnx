@@ -18,8 +18,10 @@ What each block below pins, and why it would matter if it broke:
 6. An unknown backend is a ValueError before any file is touched.
 7. Concurrent calls from several threads on one agent return what serial calls return. This is
    the reason the session keeps one InferRequest per thread instead of calling the compiled model.
-8. A process that chose OpenVINO never imports onnxruntime (nor torch), checked in a subprocess
+8. A process on the default (OpenVINO) backend never imports onnxruntime (nor torch), checked in a subprocess
    with an import blocker so a guarded `try: import onnxruntime` cannot hide.
+9. Without openvino installed, the default backend fails with an ImportError that says how to fix
+   it, and backend="onnxruntime" still works -- the upgrade path for an onnxruntime-only install.
 """
 import json
 import os
@@ -160,11 +162,13 @@ try:
     check("numerics/outputs-are-not-overwritten-by-next-call", np.array_equal(first, snapshot))
 
     # --- 2. end to end through OnnxAgent ------------------------------------------------------
-    a_ort, a_ov = OnnxAgent(ck), OnnxAgent(ck, backend="openvino")
-    check("agent/default-backend-is-onnxruntime", a_ort.backend == "onnxruntime", a_ort.backend)
-    check("agent/backend-recorded", a_ov.backend == "openvino", a_ov.backend)
+    a_ort, a_ov = OnnxAgent(ck, backend="onnxruntime"), OnnxAgent(ck)
+    check("agent/default-backend-is-openvino", a_ov.backend == "openvino", a_ov.backend)
+    check("agent/explicit-onnxruntime-recorded", a_ort.backend == "onnxruntime", a_ort.backend)
+    check("agent/onnxruntime-session-class", type(a_ort.session).__name__ == "OnnxSession")
+    check("agent/load-default-is-openvino", load(ck).backend == "openvino")
     check("agent/openvino-session-class", type(a_ov.session).__name__ == "OpenVinoSession")
-    check("agent/load-passes-backend", load(ck, backend="openvino").backend == "openvino")
+    check("agent/load-passes-backend", load(ck, backend="onnxruntime").backend == "onnxruntime")
     for state in ["billing refund charge state", "good " * 60 + "bad ok"]:
         r_ort, r_ov = a_ort.predict(state, QUESTIONS), a_ov.predict(state, QUESTIONS)
         ok, detail = answers_close(r_ort["answers"], r_ov["answers"])
@@ -245,13 +249,37 @@ class Blocker:
             raise RuntimeError("blocked: " + name)
 sys.meta_path.insert(0, Blocker())
 import laya_onnx
-agent = laya_onnx.load(%r, backend="openvino")
+agent = laya_onnx.load(%r)
+assert agent.backend == "openvino", agent.backend
 agent.predict("billing refund state", {"n": {"type": "noul", "instructions": "refund state"}})
 print("ATTEMPTS", attempts)
 """ % (ROOT, ck)
     proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=300)
     check("isolation/subprocess-ran", proc.returncode == 0, (proc.stderr or proc.stdout)[-400:])
     check("isolation/no-onnxruntime-torch-transformers", "ATTEMPTS []" in proc.stdout, proc.stdout[-200:])
+
+    # --- 9. openvino missing: the default fails with directions, and onnxruntime still works ----
+    probe = r"""
+import sys
+sys.path.insert(0, %r)
+class Blocker:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "openvino":
+            raise ImportError("No module named 'openvino'")
+sys.meta_path.insert(0, Blocker())
+import laya_onnx
+try:
+    laya_onnx.load(%r)
+    print("DEFAULT loaded without openvino")
+except ImportError as e:
+    print("DEFAULT", e)
+print("ORT", laya_onnx.load(%r, backend="onnxruntime").backend)
+""" % (ROOT, ck, ck)
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=300)
+    check("no-openvino/subprocess-ran", proc.returncode == 0, (proc.stderr or proc.stdout)[-400:])
+    check("no-openvino/default-says-how-to-fix",
+          "pip install openvino" in proc.stdout and "backend='onnxruntime'" in proc.stdout, proc.stdout[-300:])
+    check("no-openvino/onnxruntime-still-loads", "ORT onnxruntime" in proc.stdout, proc.stdout[-300:])
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

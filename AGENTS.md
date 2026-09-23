@@ -105,8 +105,8 @@ change both.
 
 A torch-free ONNX runtime for the `multilingual` checkpoint (mmBERT-base, 1024/256 budget).
 `laya_onnx.load(dir)` returns an `OnnxAgent` whose `predict` / `system_one` return the same
-answer dicts as `laya.Agent` from a process holding onnxruntime and numpy and **neither torch
-nor transformers**. Spec: `docs/superpowers/specs/2026-09-21-laya-onnx-port.md`. Plan:
+answer dicts as `laya.Agent` from a process holding one runtime (OpenVINO by default, or
+onnxruntime) and numpy and **neither torch nor transformers**. Spec: `docs/superpowers/specs/2026-09-21-laya-onnx-port.md`. Plan:
 `docs/superpowers/plans/2026-09-21-laya-onnx-port.md`. Measurements and their provenance live in
 `laya_onnx/README.md`, which is the evidence document for this package the way the root README is
 for `laya/`.
@@ -114,8 +114,8 @@ for `laya/`.
 **`laya_onnx` ships in no wheel.** `pyproject.toml` keeps `packages = ["laya"]`, deliberately, so
 a `pip install laya` gets the torch package and nothing else; `laya_onnx` is importable from a
 checkout, which is what the ONNX tests, the export CLIs and the benchmarks use. The consequence
-to hold in mind: `[project.optional-dependencies]` does publish `onnx` and `onnx-export` extras,
-so `pip install laya[onnx]` installs onnxruntime and tokenizers and hands the user no module
+to hold in mind: `[project.optional-dependencies]` does publish `onnx`, `onnx-onnxruntime` and
+`onnx-export` extras, so `pip install laya[onnx]` installs openvino and tokenizers and hands the user no module
 that imports them. The extras are correct for a checkout and wrong for a release, and both
 files say so — shipping `laya_onnx` in the wheel is a separate decision that also changes what
 `tests/test_packaging.py` has to assert.
@@ -207,16 +207,17 @@ runs. `laya_onnx/README.md` carries the full tables with the machine block, plus
 (MatMul 56% of kernel time at 4 threads) and the finding that onnxruntime's transformer
 optimizer fuses only GELU on this capture. Any new latency claim gets the same scoping these do.
 
-**The OpenVINO backend** (`backend="openvino"`, `session_openvino.py`) runs the same export and
-is the faster runtime on this host: 2.06–2.84x at each runtime's default threads, 1.05–1.46x
+**The OpenVINO backend is the default** (`backend="openvino"`, `session_openvino.py`). It runs the
+same export and is the faster runtime on this host: 2.06–2.84x at each runtime's default threads, 1.05–1.46x
 with both at 4 threads (1–50 questions; 3 warmup / 20 timed). The default-thread gap is partly
 OpenVINO keeping its pool on one socket, so do not quote it without the 4-thread row. It pins
 `INFERENCE_PRECISION_HINT=f32` and refuses to serve if the plugin reports otherwise — on AMX /
 AVX512_BF16 hardware the plugin would pick bf16 on its own. It keeps one `InferRequest` per
 thread because a shared one raises `Infer Request is busy` under concurrent `predict` calls
 (verified by mutation). `runtime.py` imports only the selected backend, so an OpenVINO-only
-process needs no onnxruntime; `tests/test_onnx_openvino.py` asserts that in a subprocess. The
-default backend stays onnxruntime until someone decides otherwise — see the spec,
+process needs no onnxruntime; `tests/test_onnx_openvino.py` asserts that in a subprocess.
+`backend="onnxruntime"` remains fully supported and tested — keep both paths green, since
+`tests/test_onnx_export.py` still validates exports through onnxruntime. Spec:
 `docs/superpowers/specs/2026-09-23-openvino-backend.md`.
 
 ## Testing

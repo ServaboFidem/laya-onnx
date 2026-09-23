@@ -80,9 +80,10 @@ from laya_onnx.sequence import build_sequence  # noqa: E402
 from laya_onnx.truncation import truncation_report  # noqa: E402
 
 DEVICE = os.environ.get("LAYA_DEVICE", "cpu")
-# Which runtime executes the export. The thresholds below are the same for both: each backend
-# runs the same fp32 graph, so each must clear the bar the port set against torch on its own.
-BACKEND = os.environ.get("LAYA_ONNX_BACKEND", "onnxruntime")
+# Which runtime executes the export; defaults to laya_onnx's own default (openvino). The thresholds
+# below are the same for both: each backend runs the same fp32 graph, so each must clear the bar
+# the port set against torch on its own. LAYA_ONNX_BACKEND=onnxruntime checks the other one.
+BACKEND = os.environ.get("LAYA_ONNX_BACKEND", "openvino")
 ONNX_DIR = os.path.expanduser(sys.argv[2] if len(sys.argv) > 2 else "~/laya_onnx_models/multilingual")
 
 PASS, FAIL = [], []
