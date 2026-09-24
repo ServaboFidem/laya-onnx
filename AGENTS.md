@@ -109,7 +109,9 @@ answer dicts as `laya.Agent` from a process holding one runtime (OpenVINO by def
 onnxruntime) and numpy and **neither torch nor transformers**. Spec: `docs/superpowers/specs/2026-09-21-laya-onnx-port.md`. Plan:
 `docs/superpowers/plans/2026-09-21-laya-onnx-port.md`. Measurements and their provenance live in
 `laya_onnx/README.md`, which is the evidence document for this package the way the root README is
-for `laya/`.
+for `laya/`. A plain-language explainer for non-specialists lives at
+`docs/onnx-and-openvino-explained.md`; its figures are copied from the README or reproduced by the
+snippet at its end, so update it whenever a number it quotes changes.
 
 **`laya_onnx` ships in no wheel.** `pyproject.toml` keeps `packages = ["laya"]`, deliberately, so
 a `pip install laya` gets the torch package and nothing else; `laya_onnx` is importable from a

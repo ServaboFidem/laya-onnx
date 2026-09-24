@@ -18,6 +18,9 @@ on OpenVINO, **3.719e-05** on onnxruntime), and OpenVINO is the faster of the tw
 configuration measured here — see [OpenVINO backend](#openvino-backend) under Latency. Every
 latency table *above* that section was taken on onnxruntime, before the default changed.
 
+For a plain-English account of what the ONNX conversion and OpenVINO compilation each change, and
+why the answers do not, see [`docs/onnx-and-openvino-explained.md`](../docs/onnx-and-openvino-explained.md).
+
 **Ship the fp32 export.** The int8 build is in the tree, is reproducible, and is measurably
 worse where it matters: `noul:2` accuracy falls 0.8833 → 0.7800 (McNemar p = 1.6e-06; pooled
 p = 3.1e-05), while ECE does not clearly separate the three graphs. The section below has the
