@@ -8,7 +8,8 @@ to suit the CPU in front of it. On the test machine, answers now come back **abo
 than onnxruntime** (the ONNX engine we started with), and the answers themselves have not
 changed.
 
-This page explains what each step does and why the answers stay the same. The technical record,
+This page explains what each step does and why the answers stay the same. For the one-picture
+version, open [`stock-onnx-openvino.html`](stock-onnx-openvino.html) in a browser. The technical record,
 with every table and caveat, is [`laya_onnx/README.md`](../laya_onnx/README.md). Every number
 here comes from there or was measured the same way on the same machine (see
 [Where the numbers come from](#where-the-numbers-come-from)).

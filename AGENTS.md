@@ -279,19 +279,20 @@ python -m compileall -q laya/ laya_onnx/ tests/
 
 ## Diagrams
 
-`docs/` holds two self-contained HTML pages — inline SVG, no build step, no JavaScript. Open them
+`docs/` holds three self-contained HTML diagrams — inline SVG, no build step, no JavaScript. Open them
 in a browser; there is nothing to compile and nothing to install.
 
 | file | what it shows | goes stale when |
 |---|---|---|
 | `docs/architecture.html` | the request path: state + questions → script detection → Router → Agent → DecisionModel → typed answers, with the Hub external and the shortlist optional | a module moves in or out of the request path |
 | `docs/router-decision-flow.html` | `Router.route()`'s real precedence: explicit `model=`/`task=`/`lang=`, then opt-in workflow match, then script and English detection | the precedence chain in `laya/router.py` changes |
+| `docs/stock-onnx-openvino.html` | stock (PyTorch), ONNX (onnxruntime) and OpenVINO laya side by side: model file → engine → one-question latency and parity, with OpenVINO's compile-time fusions | any latency, parity, size or fusion figure in `docs/onnx-and-openvino-explained.md` or `laya_onnx/README.md` changes |
 
 The second one encodes the actual branch structure of `route()`, including the `auto_task_detection`
 opt-in and the no-letters fall-back to the default. **Change that function and the diagram is wrong** —
 it is documentation of behaviour, not decoration.
 
-Both were produced with the vendored `diagram-design` skill (`.claude/skills/diagram-design/`). To
+All three were produced with the vendored `diagram-design` skill (`.claude/skills/diagram-design/`). To
 regenerate or add one, invoke that skill; it owns the layout grammar and the taste gate. Two rules
 for anyone touching it:
 
